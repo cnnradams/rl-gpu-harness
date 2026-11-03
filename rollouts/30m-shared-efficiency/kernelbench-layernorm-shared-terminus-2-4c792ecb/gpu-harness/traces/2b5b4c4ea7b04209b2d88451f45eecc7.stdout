@@ -1,0 +1,201 @@
+        exec(model_custom_src, context)
+        # DANGER: need to delete refernece from global namespace
+    except SyntaxError as e:
+        print(f"Syntax Error in custom generated code or Compilation Error {e}")
+        return None
+
+    ModelNew = context.get("ModelNew")
+    return ModelNew
+
+
+def _cleanup_cuda_extensions():
+    """Helper function to cleanup compiled CUDA extensions"""
+    # SIMON NOTE: is this necessary?
+    import shutil
+
+    torch_extensions_path = os.path.join(
+        os.path.expanduser("~"), ".cache", "torch_extensions"
+    )
+    if os.path.exists(torch_extensions_path):
+        shutil.rmtree(torch_extensions_path)
+
+
+def graceful_eval_cleanup(
+    curr_context: dict,
+    device: torch.device,
+    tempfile: tempfile.NamedTemporaryFile = None,
+):
+    """
+    Clean up env, gpu cache, and compiled CUDA extensions after evaluation
+    """  # delete ran-specific function definitions before next eval run
+    del curr_context
+    # Clear CUDA cache and reset GPU state
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+
+        # does this help?
+        torch.cuda.reset_peak_memory_stats(device=device)
+
+        torch.cuda.synchronize(
+            device=device
+        )  # Wait for all CUDA operations to complete
+    if tempfile:
+        tempfile.close()
+        os.remove(tempfile.name)
+
+    # _cleanup_cuda_extensions() # SIMON NOTE: is this necessary?
+
+
+def build_compile_cache_legacy(
+    custom_model_src: str,
+    verbose: bool = False,
+    build_dir: os.PathLike = None,
+) -> tuple[bool, str, str]:
+    """
+    Try to build the compiled cuda code for sample and store in the cache directory
+    Should be able to run on CPUs to do this massively in parallel
+
+    Don't limit ninja to set default number of workers, let it use all the cpu cores possible
+
+    NOTE: currently stdout_buffer does not capture all the compiler warning and failure messages
+    Returns:
+        tuple[bool, str]: whether compilation is successful, stdout content as string
+    """
+    context = {}
+    stdout_buffer = StringIO()
+
+    if verbose:
+        print("[Compilation] Pre-compile custom cuda binaries")
+
+    try:
+        os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
+        # sys.stdout.flush()
+
+        # Capture stdout during compilation
+        with redirect_stdout(stdout_buffer), redirect_stderr(stdout_buffer):
+            load_custom_model(custom_model_src, context, build_dir)
+            # sys.stdout.flush()
+
+        if verbose:
+            print(f"[Compilation] Compilation Successful, saved cache at: {build_dir}")
+    except Exception as e:
+        print(
+            f"[Compilation] Failed to compile custom CUDA kernel. Unable to cache, \nError: {e}"
+        )
+        return False, stdout_buffer.getvalue(), str(e)
+
+    return True, stdout_buffer.getvalue(), None
+
+
+def build_compile_cache(
+    custom_model_src: str,
+    verbose: bool = False,
+    build_dir: os.PathLike = None,
+) -> tuple[bool, str, str]:
+    """
+    Try to build the compiled cuda code for sample and store in the cache directory
+    Should be able to run on CPUs to do this massively in parallel
+
+    Don't limit ninja to set default number of workers, let it use all the cpu cores possible
+    # try do this with a subprocess
+    NOTE: currently stdout_buffer does not capture all the compiler warning and failure messages
+    Returns:
+        tuple[bool, str]: whether compilation is successful, stdout content as string
+    """
+    context = {}
+    stdout_buffer = StringIO()
+
+    if verbose:
+        print("[Compilation] Pre-compile custom cuda binaries")
+
+    try:
+        os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
+        # sys.stdout.flush()
+
+        # Capture stdout during compilation
+        with redirect_stdout(stdout_buffer), redirect_stderr(stdout_buffer):
+            load_custom_model(custom_model_src, context, build_dir)
+            # sys.stdout.flush()
+
+        if verbose:
+            print(f"[Compilation] Compilation Successful, saved cache at: {build_dir}")
+    except Exception as e:
+        print(
+            f"[Compilation] Failed to compile custom CUDA kernel. Unable to cache, \nError: {e}"
+        )
+        return False, stdout_buffer.getvalue(), str(e)
+
+    return True, stdout_buffer.getvalue(), None
+
+
+def build_compile_cache_with_capturing(
+    custom_model_src: str, verbose: bool = False, build_dir: os.PathLike = None
+) -> tuple[int, str, str]:
+    """
+    Write a temporary python file to compile the custom model on CPU
+    Captures the return code, stdout, and stderr
+    This works for capturing, build_compile_cache does not
+    """
+    if build_dir:
+        # Add import at the start of the source code
+        custom_model_src = (
+            "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_dir}'\n"
+        ) + custom_model_src
+
+    kernel_hash = hash(custom_model_src)
+    # tmp is a temp python file we write to for compilation
+    tmp = os.path.join(build_dir, f"tmp_{kernel_hash}.py")
+    os.makedirs(os.path.dirname(tmp), exist_ok=True)
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(custom_model_src)
+
+    # Execute the temporary Python file and capture output
+    process = subprocess.Popen(
+        ["python", tmp], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    stdout, stderr = process.communicate()
+    returncode = process.returncode
+
+    # Clean up temporary file
+    os.remove(tmp)
+
+    if verbose:
+        print("[CPU Precompile] return code: ", returncode)
+        print("[CPU Precompile] stdout: \n", stdout.decode("utf-8"))
+        print("[CPU Precompile] stderr: \n", stderr.decode("utf-8"))
+
+    return returncode, stdout.decode("utf-8"), stderr.decode("utf-8")
+
+
+def _process_input_tensor(input, device, backend="cuda", precision=torch.float32):
+    """
+    Helper function to move tensors to the correct device and apply backend-specific dtype casting.
+    
+    Args:
+        input: Input tensor or non-tensor value
+        device: Target CUDA device
+        backend: Backend type (e.g., 'cuda', 'triton', 'cute')
+        precision: torch.dtype 
+    Returns:
+        Processed tensor on correct device with correct dtype, or original value if not a tensor
+    """
+
+    # sometimes things like init inputs are floats (like in the case of labels / targets, classification losses, etc.) 
+    if not isinstance(input, torch.Tensor):
+        return input
+    
+    # cast to the desired percision dtype for activations
+    input_tensor = input.to(dtype=precision)
+    
+    # Default for all other backends and float types
+    return input_tensor.to(device=device)
+
+
+def eval_kernel_against_ref(
+    original_model_src: str,
+    custom_model_src: str,
+    seed_num: int = 42,
+    num_correct_trials: int = 1,
+    num_perf_trials: int = 10,
+    measure_performance: bool = False,
