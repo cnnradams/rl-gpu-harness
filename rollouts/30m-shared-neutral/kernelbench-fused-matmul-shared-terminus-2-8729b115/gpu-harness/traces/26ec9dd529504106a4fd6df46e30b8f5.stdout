@@ -1,0 +1,352 @@
+        with torch.no_grad():
+            set_seed(seed_num)  # set seed for reproducible weights
+            custom_model = ModelNew(*init_inputs)
+            assert hasattr(custom_model, "forward")
+            original_model = original_model.to(device=device, dtype=precision)
+            custom_model = custom_model.to(device=device, dtype=precision)
+            torch.cuda.synchronize(device=device)
+        if verbose:
+            print("[Eval] New Model with Custom CUDA Kernel Loaded")
+    except RuntimeError as e:
+        print(
+            f"Failed to load custom CUDA kernel; Compiled but not able to run, count as runtime error. \nError: {e}"
+        )
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        graceful_eval_cleanup(context, device, tempfile)
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        return KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )  # skip further steps
+
+    kernel_exec_result = None
+
+    # Check Correctness
+    if verbose:
+        print("[Eval] Checking Correctness")
+    try:
+        kernel_exec_result = run_and_check_correctness(
+            original_model,
+            custom_model,
+            get_inputs,
+            metadata=metadata,
+            num_correct_trials=num_correct_trials,
+            verbose=verbose,
+            seed=seed_num,
+            device=device,
+            backend=backend,
+            precision=precision,
+        )
+    except Exception as e:
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        kernel_exec_result = KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )
+
+    # Measure Performance [Optional] | conditioned on compilation + correctness + no exception so far
+    if measure_performance:
+        try:
+            if kernel_exec_result and kernel_exec_result.correctness:
+                if verbose:
+                    print("[Eval] Measuring Performance as Sample is Correct")
+
+                torch.cuda.synchronize(device=device)
+                set_seed(seed_num)
+                inputs = get_inputs()
+                # Convert inputs for performance measurement
+                inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+                
+                model_new = custom_model.to(device=device, dtype=precision)
+                torch.cuda.synchronize(device=device)
+
+                # support multiple timing backend
+                timing_fn = timing.get_timing_function(timing_method)
+                elapsed_times = timing_fn(
+                    model_new,
+                    inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                runtime_stats = timing.get_timing_stats(elapsed_times, device=device)
+
+                if verbose:
+                    print(f"[Eval] Performance Stats: {runtime_stats}")
+                kernel_exec_result.runtime = runtime_stats["mean"]
+                kernel_exec_result.runtime_stats = runtime_stats
+
+        except Exception as e:
+            if verbose:
+                print(f"[Eval] Error in Measuring Performance: {e}")
+            kernel_exec_result.metadata["error_during_performance"] = e
+
+    # To get base PyTorch time (eager, various compile modes)
+    # please use timing.measure_ref_program_time()   
+
+
+    ###############################################################
+    # [Experimental] to be modularized
+    # Condition: custom kernel ModelNew is correct and we are able to time it correctly with kernel_exec_result
+    # We are working on preventing excessive speedup issues
+    ##############################################################
+
+    if measure_performance and check_for_excessive_speedup:  # experimental: hence able to shut off codepath if needed
+    
+        if verbose:
+            print("[Eval] Additional checks to flag excessive speedup")
+
+        torch.cuda.synchronize(device=device)
+        set_seed(seed_num)
+        inputs = get_inputs()
+        # Convert inputs for performance measurement
+        inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+        
+        model_new = custom_model.to(device=device, dtype=precision)
+        torch.cuda.synchronize(device=device)
+
+        # time PyTorch reference function
+        # same timing_fn as specified from before
+        timing_fn = timing.get_timing_function(timing_method)
+        reference_elapsed_times = timing_fn(
+            original_model,
+            inputs, # ideally cloned for extra safety but handled already in correctness check
+            num_trials=num_perf_trials,
+            verbose=verbose,
+            device=device,
+        )
+        reference_runtime_stats = timing.get_timing_stats(reference_elapsed_times, device=device)
+        kernel_exec_result.ref_runtime = reference_runtime_stats["mean"]
+        kernel_exec_result.ref_runtime_stats = reference_runtime_stats
+
+        # Compute Effective Speedup
+        effective_speedup = kernel_exec_result.ref_runtime / kernel_exec_result.runtime
+
+        # TODO: integrate SoL estimation for each unique program on designated hardware
+        # for now, we will use a heuristics such as 5-10x which is very hard to achieve
+
+        if verbose:
+            print(f"[Eval] Effective Speedup is {effective_speedup:.2f}x using timing method {timing_method}")
+
+        if effective_speedup > excessive_speedup_threshold:
+            kernel_exec_result.metadata["excessive_speedup"] = True
+            
+            print(f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected")
+            print(f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking.")
+
+
+    graceful_eval_cleanup(context, device, tempfile)
+    return kernel_exec_result
+
+
+def register_and_format_exception(
+    exception_type: str,
+    exception_msg: Exception | str,
+    metadata: dict,
+    verbose: bool = False,
+    truncate=False,
+    max_length=200,
+):
+    """
+    max_length characters
+
+    NOTE: I can't get torch truncate to work during exception handling so I have this for now
+    """
+    # Truncate exception message if too long
+    exception_str = str(exception_msg)
+    if truncate and len(exception_str) > max_length:
+        exception_str = exception_str[: max_length - 3] + "..."
+
+    if verbose:
+        print(f"[Exception {exception_type}] {exception_str} ")
+    metadata[exception_type] = exception_str
+
+    return metadata
+
+
+def run_and_check_correctness(
+    original_model_instance: nn.Module,
+    new_model_instance: nn.Module,
+    get_inputs_fn: callable,
+    metadata: dict,
+    num_correct_trials: int,
+    verbose: bool =False,
+    seed: int =42,
+    device: Optional[torch.device] =None,
+    backend: str ="cuda",
+    precision: torch.dtype =torch.float32,
+) -> KernelExecResult:
+    """
+    run the model and check correctness,
+    assume model already loaded and compiled (loaded and compiled in the caller)
+    this is all on GPU, requiring cuda device and transfer .cuda()
+
+    num_correct_trials: run the evalutation multiple times with (ideally) different random inputs to ensure correctness
+    backend: backend type for handling dtype conversions
+    precision: torch.dtype
+    """
+    pass_count = 0
+
+    # Generate num_correct_trials seeds deterministically from the initial seed
+    torch.manual_seed(seed)
+    correctness_trial_seeds = [
+        torch.randint(0, 2**32 - 1, (1,)).item() for _ in range(num_correct_trials)
+    ]
+
+    with torch.no_grad():
+
+        for trial in range(num_correct_trials):
+
+            trial_seed = correctness_trial_seeds[trial]
+            if verbose:
+                print(f"[Eval] Generating Random Input with seed {trial_seed}")
+
+            set_seed(trial_seed)
+            inputs = get_inputs_fn()
+            # Convert inputs to appropriate dtypes for GPU computation
+            inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+
+            set_seed(trial_seed)
+    
+            model = original_model_instance.to(device=device, dtype=precision)
+
+            set_seed(trial_seed)
+     
+            model_new = new_model_instance.to(device=device, dtype=precision)
+
+            output = model(*inputs)
+            torch.cuda.synchronize(device=device)
+            # ensure all GPU operations are completed before checking results
+
+            try:
+                output_new = model_new(*inputs)
+                torch.cuda.synchronize(device=device)
+                if output.shape != output_new.shape:
+                    metadata = register_and_format_exception(
+                        "correctness_issue",
+                        f"Output shape mismatch: Expected {output.shape}, got {output_new.shape}",
+                        metadata,
+                    )
+                    metadata["correctness_issue_name"] = "correctness_issue"
+                    if verbose:
+                        print(
+                            f"[FAIL] trial {trial}: Output shape mismatch: Expected {output.shape}, got {output_new.shape}"
+                        )
+                    return KernelExecResult(
+                        compiled=True, correctness=False, metadata=metadata
+                    )
+
+                # in torchbench, they use both precisions for atol and rtol
+                # kernelbench v0 and v0.1 uses fp32, atol = rtol = 1e-02
+                # now we will return the tolerance from get_tolerance_for_precision
+                tolerance = get_tolerance_for_precision(precision)
+                # check output value difference
+                if not torch.allclose(
+                    output, output_new, atol=tolerance, rtol=tolerance
+                ):  # fail
+                    max_diff = torch.max(torch.abs(output - output_new)).item()
+                    avg_diff = torch.mean(torch.abs(output - output_new)).item()
+                    metadata.setdefault("max_difference", []).append(f"{max_diff:.6f}")
+                    metadata.setdefault("avg_difference", []).append(f"{avg_diff:.6f}")
+                    metadata["correctness_issue"] = "Output mismatch"
+                    if verbose:
+                        print(f"[FAIL] trial {trial}: Output mismatch")
+                else:  # pass
+                    pass_count += 1
+                    if verbose:
+                        print(f"[PASS] trial {trial}: New Model matches Model")
+
+            except Exception as e:
+                print("[Error] Exception happens during correctness check")
+                print(f"Error in launching kernel for ModelNew: {e}")
+                print("\n[Full Traceback]:")
+                traceback.print_exc()
+                print("\n")
+
+                metadata = register_and_format_exception(
+                    "runtime_error", e, metadata, truncate=True
+                )
+                metadata["runtime_error_name"] = get_error_name(e)
+                # Also store the full traceback in metadata for debugging
+                metadata["runtime_error_traceback"] = traceback.format_exc()
+                return KernelExecResult(
+                    compiled=True, correctness=False, metadata=metadata
+                )
+                # break
+
+    if verbose:
+        print(
+            f"[Eval] Pass count: {pass_count}, num_correct_trials: {num_correct_trials}"
+        )
+
+    # put all the useful info here!
+    metadata["correctness_trials"] = f"({pass_count} / {num_correct_trials})"
+
+    if pass_count == num_correct_trials:
+        return KernelExecResult(compiled=True, correctness=True, metadata=metadata)
+    else:
+        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+
+
+def check_metadata_serializable(metadata: dict):
+    """
+    Ensure metadata is JSON serializable,
+    if not, convert non-serializable values to strings
+    """
+    try:
+        json.dumps(metadata)
+    except (TypeError, OverflowError) as e:
+        print(f"[WARNING] Metadata is not JSON serializable, error: {str(e)}")
+        # Convert non-serializable values to strings
+        metadata = {
+            "eval_0": {
+                k: (
+                    str(v)
+                    if not isinstance(
+                        v, (dict, list, str, int, float, bool, type(None))
+                    )
+                    else v
+                )
+                for k, v in metadata["eval_0"].items()
+            }
+        }
+        print(
+            f"[WARNING] Metadata now converted to string: {metadata} to be JSON serializable"
+        )
+
+    return metadata
+
+
+def check_metadata_serializable_all_types(metadata: dict):
+    """
+    Ensure metadata is JSON serializable,
+    if not, convert non-serializable values to strings recursively
+    """
+
+    def convert_to_serializable(obj):
+        if isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_serializable(v) for v in obj]
+        elif isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+        else:
+            return str(obj)
+
+    try:
+        json.dumps(metadata)
+        return metadata
+    except (TypeError, OverflowError) as e:
+        print(f"[WARNING] Metadata is not JSON serializable, error: {str(e)}")
+        # Convert non-serializable values to strings recursively
+        converted_metadata = convert_to_serializable(metadata)
+        print(
+            f"[WARNING] Metadata now converted to be JSON serializable: {converted_metadata}"
+        )
+        return converted_metadata
+
+
+# if __name__ == "__main__":
+# fetch_kernel_from_database("kernelbench_prompt_v2_level_2", 1, 1, "http://localhost:9091")
+# print(fetch_ref_arch_from_level_problem_id("2", 1, with_name=True))

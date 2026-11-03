@@ -1,0 +1,200 @@
+"""
+Helpers for Evaluations
+"""
+
+import hashlib
+import importlib
+import json
+import linecache
+import os, subprocess
+import random
+import sys
+import tempfile
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from typing import Union, Optional
+
+import numpy as np
+import requests
+import torch
+import torch.nn as nn
+from pydantic import BaseModel
+
+from . import timing, dataset
+
+REPO_TOP_PATH = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "../..",
+    )
+)
+KERNEL_BENCH_PATH = os.path.join(REPO_TOP_PATH, "KernelBench")
+
+
+def get_error_name(e: Exception) -> str:
+    """
+    Get the error name, for logging purposes
+    """
+    return f"{e.__class__.__module__}.{e.__class__.__name__}"
+
+
+def fetch_ref_arch_from_problem_id(problem_id: int, dataset: "BaseDataset", with_name=False) -> Union[str, tuple[str, str]]:
+    """
+    Fetches the reference architecture for a given problem_id from the dataset.
+    """
+    if isinstance(problem_id, str):
+        problem_id = int(problem_id)
+
+    problem = dataset.get_problem_by_id(problem_id)
+    ref_arch = problem.code
+    
+    if not with_name:
+        return ref_arch
+    else:
+        # Use problem.name as fallback when path is None (e.g., for HuggingFace datasets)
+        name = problem.path if problem.path is not None else problem.name
+        return (name, ref_arch)
+
+
+def fetch_ref_arch_from_level_problem_id(level, problem_id, with_name=False):
+    kb_dataset = dataset.construct_kernelbench_dataset(level)
+    return fetch_ref_arch_from_problem_id(problem_id, kb_dataset, with_name)
+
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    # NOTE: this only sets on current cuda device
+    torch.cuda.manual_seed(seed)
+
+def get_torch_dtype_from_string(precision: str) -> torch.dtype:
+    """
+    Get the torch dtype for specific precision
+    """
+    if precision == "fp32":
+        return torch.float32
+    elif precision == "fp16":
+        return torch.float16
+    elif precision == "bf16":
+        return torch.bfloat16
+    else: # future, FP8, FP4, etc. support?
+        raise ValueError(f"Invalid precision not supported: {precision}")
+
+def get_tolerance_for_precision(precision: str | torch.dtype) -> float:
+    """
+    Get the tolerance from a string representing the percision.
+    These tolerances are inspired by torchbench (PyTorch Benchmarking Suite): 
+    Reference:
+    https://github.com/pytorch/benchmark/blob/cfd835c35d04513ced9a59bd074eeb21dc8187d7/torchbenchmark/util/env_check.py#L519
+    """
+    if isinstance(precision, str):
+        precision = get_torch_dtype_from_string(precision)
+
+    PRECISION_TOLERANCES = {
+        # By default for fp32, 1e-4 is used according to torchbench.
+        torch.float32: 1e-4,
+        # torchbench states for bf16 and fp16, use 1e-3 as tolerance and 1e-2 if it's too strict. 
+        # @todo: Let user configure own tolerance as an option
+        torch.float16: 1e-2, 
+        torch.bfloat16: 1e-2,
+    }
+    assert precision in PRECISION_TOLERANCES, f"Invalid precision not supported: {precision}"
+    return PRECISION_TOLERANCES[precision]
+    
+
+class KernelExecResult(BaseModel):
+    """
+    Single Kernel Execution
+    """
+    # Execution
+    compiled: bool = False
+    correctness: bool = False
+    metadata: dict = {} # NOTE: to include warning if any
+
+    # Timing
+    runtime: float = -1.0  # in us, only recorded if we decide to measure performance
+    runtime_stats: dict = {}  # only recorded if we decide to measure performance
+
+    # new: added ref time either through fetching prev runs or through execution
+    # could do eager for level 1 and compile for level 2 and 3
+    ref_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
+    ref_runtime_stats: dict = {} # only recorded if we decide to measure performance
+
+
+def load_original_model_and_inputs(
+    model_original_src: str, context: dict
+) -> tuple[nn.Module, callable, callable]:
+    """
+    Load class from original NN.module pytorch code
+    this is pytorch reference and we feed that to model to see if there will be any improvement
+    """
+
+    try:
+        compile(model_original_src, "<string>", "exec")
+    except SyntaxError as e:
+        print(f"Syntax Error in original code {e}")
+        return None
+
+    try:
+        exec(model_original_src, context)  # expose to current namespace
+    except Exception as e:
+        print(f"Error in executing original code {e}")
+        return None
+
+    # these should be defined in the original model code and present in the context
+    get_init_inputs_fn = context.get("get_init_inputs")
+    get_inputs_fn = context.get("get_inputs")
+    Model = context.get("Model")
+    return (Model, get_init_inputs_fn, get_inputs_fn)
+
+
+def load_custom_model_with_tempfile(model_custom_src, entry_point="ModelNew"):
+    """
+    Writes the provided Python code string to a temporary .py file,
+    dynamically imports the module so we can access the modified model class.
+
+    Returns both a Model class and the temporary file. The temporary file must be
+    deleted manually be the caller.
+
+    This is a hack that is needed for triton code as compile / exec do not play well
+    with the @triton.jit decorator.
+    """
+
+    # Create a temporary named file with a .py extension
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp_file:
+        # Write the code string into the file
+        tmp_file.write(model_custom_src)
+        # Capture the path to the file
+        tempfile_path = tmp_file.name
+        temp_file = tmp_file
+
+    # Create a module specification pointing to our temp file
+    spec = importlib.util.spec_from_file_location("temp_module", tempfile_path)
+    # Create a new module based on that spec
+    temp_module = importlib.util.module_from_spec(spec)
+    # Execute the code in the module's namespace
+    spec.loader.exec_module(temp_module)
+
+    ModelNew = getattr(temp_module, entry_point)
+
+    # Return the object (class, function, etc.) that was defined in the code
+    return ModelNew, temp_file
+
+
+def load_custom_model(
+    model_custom_src: str, context: dict, build_directory: str = None
+) -> nn.Module:
+    """
+    Load class from custom NN.module pytorch code
+    this is the code output by LLM with calls to custom cuda kernels
+    """
+    if build_directory:
+        context["BUILD_DIRECTORY"] = build_directory
+        # Add import at the start of the source code
+        model_custom_src = (
+            "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_directory}'\n"
+        ) + model_custom_src
+
+    try:
+        compile(model_custom_src, "<string>", "exec")
+        exec(model_custom_src, context)

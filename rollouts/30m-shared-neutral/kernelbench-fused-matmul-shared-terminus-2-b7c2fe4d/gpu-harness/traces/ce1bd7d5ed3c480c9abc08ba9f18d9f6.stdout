@@ -1,0 +1,181 @@
+        else:
+            # Default CUDA backend
+            ModelNew = load_custom_model(custom_model_src, context, build_dir)
+        torch.cuda.synchronize(device=device)  # not sure if this is too much
+    except Exception as e:
+        print(
+            f"Failed to compile custom CUDA kernel: Record as compilation failure. \nError: {e}"
+        )
+        # TODO: add metadata for compilation error (how to we get the compilation error message?)
+
+        if "lock" in str(e) or "No such file or directory" in str(e):
+            # this is a lock file error, likely due to concurrent compilation
+            # this does not necessarily mean the compilation failed, but we should retry
+            print(
+                f"[Eval] Lock file error during compilation, Please retry. Error: {e}"
+            )
+            graceful_eval_cleanup(context, device, tempfile)
+            return None
+        else:
+            metadata["compilation_error_name"] = get_error_name(e)
+            metadata["compilation_error"] = e
+            graceful_eval_cleanup(context, device, tempfile)
+            return KernelExecResult(
+                compiled=False, metadata=metadata
+            )  # skip further steps
+
+    # Check if ModelNew was successfully loaded (load_custom_model returns None on syntax errors)
+    if ModelNew is None:
+        print(
+            "Failed to load custom model: Syntax error or ModelNew not found in generated code. Record as compilation failure."
+        )
+        metadata["compilation_error_name"] = "SyntaxError"
+        metadata["compilation_error"] = "Syntax error in custom generated code or ModelNew not found"
+        graceful_eval_cleanup(context, device, tempfile)
+        return KernelExecResult(
+            compiled=False, metadata=metadata
+        )  # skip further steps
+
+    # at this point we passed compilation
+    try:
+        with torch.no_grad():
+            set_seed(seed_num)  # set seed for reproducible weights
+            custom_model = ModelNew(*init_inputs)
+            assert hasattr(custom_model, "forward")
+            original_model = original_model.to(device=device, dtype=precision)
+            custom_model = custom_model.to(device=device, dtype=precision)
+            torch.cuda.synchronize(device=device)
+        if verbose:
+            print("[Eval] New Model with Custom CUDA Kernel Loaded")
+    except RuntimeError as e:
+        print(
+            f"Failed to load custom CUDA kernel; Compiled but not able to run, count as runtime error. \nError: {e}"
+        )
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        graceful_eval_cleanup(context, device, tempfile)
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        return KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )  # skip further steps
+
+    kernel_exec_result = None
+
+    # Check Correctness
+    if verbose:
+        print("[Eval] Checking Correctness")
+    try:
+        kernel_exec_result = run_and_check_correctness(
+            original_model,
+            custom_model,
+            get_inputs,
+            metadata=metadata,
+            num_correct_trials=num_correct_trials,
+            verbose=verbose,
+            seed=seed_num,
+            device=device,
+            backend=backend,
+            precision=precision,
+        )
+    except Exception as e:
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        kernel_exec_result = KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )
+
+    # Measure Performance [Optional] | conditioned on compilation + correctness + no exception so far
+    if measure_performance:
+        try:
+            if kernel_exec_result and kernel_exec_result.correctness:
+                if verbose:
+                    print("[Eval] Measuring Performance as Sample is Correct")
+
+                torch.cuda.synchronize(device=device)
+                set_seed(seed_num)
+                inputs = get_inputs()
+                # Convert inputs for performance measurement
+                inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+                
+                model_new = custom_model.to(device=device, dtype=precision)
+                torch.cuda.synchronize(device=device)
+
+                # support multiple timing backend
+                timing_fn = timing.get_timing_function(timing_method)
+                elapsed_times = timing_fn(
+                    model_new,
+                    inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                runtime_stats = timing.get_timing_stats(elapsed_times, device=device)
+
+                if verbose:
+                    print(f"[Eval] Performance Stats: {runtime_stats}")
+                kernel_exec_result.runtime = runtime_stats["mean"]
+                kernel_exec_result.runtime_stats = runtime_stats
+
+        except Exception as e:
+            if verbose:
+                print(f"[Eval] Error in Measuring Performance: {e}")
+            kernel_exec_result.metadata["error_during_performance"] = e
+
+    # To get base PyTorch time (eager, various compile modes)
+    # please use timing.measure_ref_program_time()   
+
+
+    ###############################################################
+    # [Experimental] to be modularized
+    # Condition: custom kernel ModelNew is correct and we are able to time it correctly with kernel_exec_result
+    # We are working on preventing excessive speedup issues
+    ##############################################################
+
+    if measure_performance and check_for_excessive_speedup:  # experimental: hence able to shut off codepath if needed
+    
+        if verbose:
+            print("[Eval] Additional checks to flag excessive speedup")
+
+        torch.cuda.synchronize(device=device)
+        set_seed(seed_num)
+        inputs = get_inputs()
+        # Convert inputs for performance measurement
+        inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+        
+        model_new = custom_model.to(device=device, dtype=precision)
+        torch.cuda.synchronize(device=device)
+
+        # time PyTorch reference function
+        # same timing_fn as specified from before
+        timing_fn = timing.get_timing_function(timing_method)
+        reference_elapsed_times = timing_fn(
+            original_model,
+            inputs, # ideally cloned for extra safety but handled already in correctness check
+            num_trials=num_perf_trials,
+            verbose=verbose,
+            device=device,
+        )
+        reference_runtime_stats = timing.get_timing_stats(reference_elapsed_times, device=device)
+        kernel_exec_result.ref_runtime = reference_runtime_stats["mean"]
+        kernel_exec_result.ref_runtime_stats = reference_runtime_stats
+
+        # Compute Effective Speedup
+        effective_speedup = kernel_exec_result.ref_runtime / kernel_exec_result.runtime
+
+        # TODO: integrate SoL estimation for each unique program on designated hardware
+        # for now, we will use a heuristics such as 5-10x which is very hard to achieve
+
+        if verbose:
+            print(f"[Eval] Effective Speedup is {effective_speedup:.2f}x using timing method {timing_method}")
+
+        if effective_speedup > excessive_speedup_threshold:
+            kernel_exec_result.metadata["excessive_speedup"] = True
+            
+            print(f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected")
+            print(f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking.")
+
+
+    graceful_eval_cleanup(context, device, tempfile)
+    return kernel_exec_result
+

@@ -1,0 +1,879 @@
+[?2004hroot@modal:/# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@modal:/# clear
+[?2004l[H[J[?2004hroot@modal:/# ls -la /workspace/
+[?2004ltotal 16
+-rw-rw-rw- 1 root root   11 Nov  1 23:58 .dockerignore
+-rw-rw-rw- 1 root root 4080 Nov  1 23:58 evaluate.py
+-rw-rw-rw- 1 root root  230 Nov  1 23:58 metadata.json
+drwxrwxrwx 1 root root    0 Nov  1 23:58 [0m[34;42mtemplates[0m
+-rwxr-xr-x 1 root root  519 Nov  3 05:08 [01;32mtimer.sh[0m
+[?2004hroot@modal:/# bash /workspace/timer.sh
+[?2004lRemaining time (hours:minutes):
+0:29
+[?2004hroot@modal:/# cat /workspace/evaluate.py 2>/dev/null | head -100
+[?2004l#!/usr/bin/env python3
+from __future__ import annotations
+import os
+
+import argparse
+import json
+
+from inspect_ai.log._log import EvalLog, EvalMetric, EvalSample
+from inspect_ai import eval as inspect_eval  # type: ignore  # noqa: E402
+from inspect_ai.util._display import init_display_type  # noqa: E402
+
+import inspect_evals.gsm8k # noqa: F401, E402  (registers task definitions)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Inspect AI eval without banners.")
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default="final_model",
+        help="Path to the Hugging Face model (directory or model identifier).",
+    )
+    # this is a good limit for this task, just keep it like that (or use less in case you want faster tests)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=150,
+        help="Optional limit for number of samples to evaluate.",
+    )
+    parser.add_argument(
+        '--json-output-file',
+        type=str,
+        default=None,
+        help="Optional path to output the metrics as a seperate JSON file.",
+    )
+    parser.add_argument(
+        '--templates-dir',
+        type=str,
+        default="templates/",
+    )
+    # You can adjust --max-connections if you want faster tests and don't receive errors (or if you have issues with vllm, try lowering this value)
+    parser.add_argument(
+        "--max-connections",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=4000,
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.3,
+    )
+    return parser.parse_args()
+
+def main() -> None:
+    args = parse_args()
+
+    init_display_type("plain")
+
+    other_kwargs = {}
+    if (args.limit is not None) and (args.limit != -1):
+        other_kwargs["limit"] = args.limit
+
+    task = "inspect_evals/gsm8k"
+    model_args = {
+        'gpu_memory_utilization': args.gpu_memory_utilization,
+    }
+    model_args.update(template_kwargs(args))
+
+    eval_out = inspect_eval(
+        task,
+        model=f"vllm/{args.model_path}",
+        model_args=model_args,
+        score_display=False,
+        log_realtime=False,
+        log_format='json',
+        timeout=18000000,
+        attempt_timeout=18000000,
+        max_tokens=args.max_tokens,
+        max_connections=args.max_connections,
+        **other_kwargs,
+    )
+
+    if args.json_output_file is not None:
+        assert len(eval_out) == 1, eval_out
+        assert len(eval_out[0].results.scores) == 1, eval_out[0].results.scores
+        metrics = {}
+        for k, v in eval_out[0].results.scores[0].metrics.items():
+            metrics[k] = v.value
+
+        with open(args.json_output_file, 'w') as f:
+            json.dump(metrics, f, indent=2)
+
+def model_type(args) -> str:
+    if 'qwen' in args.model_path.lower():
+        return 'qwen'
+[?2004hroot@modal:/# ls /workspace/templates/ 2>/dev/null; cat /home/agent/contamination_check.py | head -50
+[?2004lgemma3.jinja  gemma3_tool_calling.jinja  qwen3.jinja  smollm.jinja
+#!/usr/bin/env python3
+"""
+Contamination detection tool matching decon's SIMPLE algorithm.
+
+Uses BPE tokenization (cl100k), sampled n-gram detection with bidirectional
+cluster expansion, field-specific n-gram sizes (question=5, answer=3,
+passage=4), positional answer/passage boundary detection, adaptive weight
+redistribution, and cumulative-length threshold adjustment.
+
+Usage:
+    python contamination_check_new.py --reference test_data.json --input training.jsonl
+
+    # From stdin (JSONL)
+    cat training.jsonl | python contamination_check_new.py --reference test_data.json
+
+    # Plain text input (one document per line)
+    echo "some text" | python contamination_check_new.py --reference test_data.json --input-format text
+"""
+
+import argparse
+import json
+import math
+import re
+import sys
+from collections import Counter
+from dataclasses import dataclass, field as dc_field
+from pathlib import Path
+
+import tiktoken
+
+# ---------- decon defaults ----------
+QUESTION_NGRAM_SIZE = 5
+ANSWER_NGRAM_SIZE = 3
+PASSAGE_NGRAM_SIZE = 4
+CONTAMINATION_THRESHOLD = 0.8
+PERFECT_MATCH_DECAY_START = 20   # tokens
+PERFECT_MATCH_DECAY_END = 50     # tokens
+SHORT_ANSWER_TOKEN_THRESHOLD = 3
+SHORT_ANSWER_WINDOW_LENGTH = 50
+MIN_LONG_ANSWER_WINDOW = 100
+MIN_PASSAGE_DISTANCE = 100
+PASSAGE_MAX_CONSECUTIVE_MISSES = 2
+SAMPLE_EVERY_M_TOKENS = 10
+QUESTION_MAX_CONSECUTIVE_MISSES = 11
+MIN_INFORMATIVE_NGRAMS = 20
+MIN_INFORMATIVE_ANSWER_TOKENS = 4
+TOKENIZER_NAME = "cl100k_base"
+
+# Text normalization (decon common/text.rs)
+DEFAULT_PUNCTUATION_CHARS = "!'\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~\u201c\u201d\u2018\u2019\u2014"
+[?2004hroot@modal:/# sed -n '100,200p' /workspace/evaluate.py
+[?2004l        return 'qwen'
+    if 'llama' in args.model_path.lower():
+        return 'llama'
+    if 'gemma' in args.model_path.lower():
+        return 'gemma'
+    if 'smollm' in args.model_path.lower():
+        return 'smollm'
+
+    with open(os.path.join(args.model_path, "config.json"), 'r') as f:
+        config = json.load(f)
+    architecture = config['architectures'][0].lower()
+    if 'gemma' in architecture:
+        return 'gemma'
+    if 'llama' in architecture:
+        return 'llama'
+    if 'qwen' in architecture:
+        return 'qwen'
+    if 'smollm' in architecture:
+        return 'smollm'
+    raise ValueError(architecture)
+
+def template_kwargs(args) -> dict:
+    model_type_str = model_type(args)
+    if model_type_str == 'qwen':
+        template = 'qwen3.jinja'
+    elif model_type_str == 'llama':
+        template = 'llama3.jinja'
+    elif model_type_str == 'gemma':
+        template = 'gemma3.jinja'
+    elif model_type_str == 'smollm':
+        template = 'smollm.jinja'
+    else:
+        raise ValueError(model_type_str)
+    return {
+        'chat_template': os.path.join(args.templates_dir, template)
+    }
+
+if __name__ == "__main__":
+    main()
+[?2004hroot@modal:/# cat /workspace/templates/qwen3.jinja
+[?2004l{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n" }}{{ '{"name": <function-name>, "arguments": <args-json-object>}' }}{{- "\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+        {%- set ns.multi_step_tool = false %}
+        {%- set ns.last_query_index = index %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if message.content is string %}
+        {%- set content = message.content %}
+    {%- else %}
+        {%- set content = '' %}
+    {%- endif %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+                {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if loop.index0 > ns.last_query_index %}
+            {%- if loop.last or (not loop.last and reasoning_content) %}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\n' + content }}
+            {%- endif %}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and content) or (not loop.first) %}
+                    {{- '\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}
+[?2004hroot@modal:/# nvidia-smi 2>/dev/null | head -15; gpu --help 2>&1 | head -30
+[?2004lusage: gpu [-h] [--key KEY] [--timeout TIMEOUT] [--cwd CWD] [--detach]
+           [--config CONFIG]
+           {policy,run,stop,status,wait,sync} [args ...]
+
+GPU boxes through a shared Modal service
+
+positional arguments:
+  {policy,run,stop,status,wait,sync}
+  args
+
+options:
+  -h, --help            show this help message and exit
+  --key KEY             Reuse this request ID after a lost response
+  --timeout TIMEOUT     Optional timeout for the remote command, in seconds
+  --cwd CWD
+  --detach
+  --config CONFIG       Optional JSON config instead of environment
+                        configuration
+
+Commands:
+  gpu policy
+  gpu run [options] -- PROGRAM [ARG ...]
+  gpu stop BOX
+  gpu status COMMAND
+  gpu wait COMMAND
+  gpu sync
+
+run starts a GPU box for its command and returns command and box IDs.
+The box stops when that command exits. run waits unless --detach is set.
+CPU /workspace writes are committed before each run; GPU writes commit on exit.
+[?2004hroot@modal:/# python -c "import torch, transformers, datasets; print(torch.__version__, transformers.__version__, datasets.__version__)"
+[?2004l2.8.0+cu129 4.57.3 4.5.0
+[?2004hroot@modal:/# python -c "import inspect_evals.gsm8k as m; print(m.__file__)"
+[?2004l/usr/local/lib/python3.10/dist-packages/inspect_evals/gsm8k/__init__.py
+[?2004hroot@modal:/# find / -path /proc -prune -o -name "gsm8k*" -print 2>/dev/null | grep -v proc | head
+[?2004l/usr/local/lib/python3.10/dist-packages/inspect_evals/abstention_bench/recipe/abstention_datasets/gsm8k.py
+/usr/local/lib/python3.10/dist-packages/inspect_evals/abstention_bench/recipe/abstention_datasets/__pycache__/gsm8k.cpython-310.pyc
+/usr/local/lib/python3.10/dist-packages/inspect_evals/abstention_bench/configs/dataset/gsm8k.yaml
+/usr/local/lib/python3.10/dist-packages/inspect_evals/gsm8k
+/usr/local/lib/python3.10/dist-packages/inspect_evals/gsm8k/gsm8k.py
+/usr/local/lib/python3.10/dist-packages/inspect_evals/gsm8k/__pycache__/gsm8k.cpython-310.pyc
+/usr/local/lib/python3.10/dist-packages/lm_eval/tasks/gsm8k_platinum
+/usr/local/lib/python3.10/dist-packages/lm_eval/tasks/gsm8k_platinum/gsm8k-platinum-cot-llama.yaml
+/usr/local/lib/python3.10/dist-packages/lm_eval/tasks/gsm8k_platinum/gsm8k-platinum.yaml
+/usr/local/lib/python3.10/dist-packages/lm_eval/tasks/gsm8k_platinum/gsm8k-platinum-cot-self-consistency.yaml
+[?2004hroot@modal:/# gpu policy
+[?2004l{
+  "trial": "e8494798f78f4d39b03080c086871747",
+  "limits": {
+    "gpu": "H100!",
+    "gpus_per_box": 1,
+    "max_boxes": 1,
+    "box_seconds": 1800,
+    "gpu_seconds": null,
+    "cpu": 16.0,
+    "memory": 131072,
+    "image_id": "im-rZBzZ4pmWyPOtkyRqkrioU",
+    "shared_workspace": true,
+    "run_only": true,
+    "block_network": false,
+    "idle_seconds": null,
+    "idle_probe": "commands"
+  },
+  "boxes": [],
+  "gpu_seconds_used": 0,
+  "gpu_time_accounting_complete": true
+}
+[?2004hroot@modal:/# cat /usr/local/lib/python3.10/dist-packages/inspect_evals/gsm8k/gsm8k.py
+[?2004l"""
+Training Verifiers to Solve Math Word Problems
+
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, John Schulman
+https://arxiv.org/abs/2110.14168
+
+# run with default fewshots (10)
+inspect eval gsm8k.py
+
+# run with less  or no fewshots
+inspect eval gsm8k.py -T fewshot=5
+inspect eval gsm8k.py -T fewshot=false
+"""
+
+from typing import Any
+
+from inspect_ai import Task, task
+from inspect_ai.dataset import Sample, hf_dataset
+from inspect_ai.scorer import match
+from inspect_ai.solver import generate, prompt_template, system_message
+
+from inspect_evals.utils import create_stable_id
+
+DATASET_PATH = "openai/gsm8k"
+
+# setup for problem + instructions for providing answer
+MATH_PROMPT_TEMPLATE = """
+Solve the following math problem step by step. The last line of your response should be of the form "ANSWER: $ANSWER" (without quotes) where $ANSWER is the answer to the problem.
+
+{prompt}
+
+Remember to put your answer on its own line at the end in the form "ANSWER: $ANSWER" (without quotes) where $ANSWER is the answer to the problem, and you do not need to use a \\boxed command.
+
+Reasoning:
+""".strip()
+
+
+@task
+def gsm8k(
+    fewshot: int = 10, fewshot_seed: int = 42, shuffle_fewshot: bool = True
+) -> Task:
+    """Inspect Task definition for the GSM8K benchmark
+
+    Args:
+        fewshot (int): The number of few shots to include
+        fewshot_seed (int): The seed for generating few shots
+        shuffle_fewshot (bool): Whether we take the first N samples of the dataset as the fewshot examples, or randomly sample to get the examples.
+    """
+    # build solver dynamically (may or may not be doing fewshot)
+    solver = [prompt_template(MATH_PROMPT_TEMPLATE), generate()]
+    if fewshot:
+        fewshots = hf_dataset(
+            path=DATASET_PATH,
+            data_dir="main",
+            split="train",
+            sample_fields=record_to_sample,
+            shuffle=shuffle_fewshot,
+            seed=fewshot_seed,
+            limit=fewshot,
+        )
+        solver.insert(
+            0,
+            system_message(
+                "\n\n".join([sample_to_fewshot(sample) for sample in fewshots])
+            ),
+        )
+
+    # define task
+    return Task(
+        dataset=hf_dataset(
+            path="openai/gsm8k",
+            data_dir="main",
+            split="test",
+            sample_fields=record_to_sample,
+        ),
+        solver=solver,
+        scorer=match(numeric=True),
+    )
+
+
+def record_to_sample(record: dict[str, Any]) -> Sample:
+    DELIM = "####"
+    input = record["question"]
+    answer = record["answer"].split(DELIM)
+    target = answer.pop().strip()
+    reasoning = DELIM.join(answer)
+    id = create_stable_id(input, prefix="gsm8k")
+    return Sample(
+        id=id, input=input, target=target, metadata={"reasoning": reasoning.strip()}
+    )
+
+
+def sample_to_fewshot(sample: Sample) -> str:
+    if sample.metadata:
+        return (
+            f"{sample.input}\n\nReasoning:\n"
+            + f"{sample.metadata['reasoning']}\n\n"
+            + f"ANSWER: {sample.target}"
+        )
+    else:
+        return ""
+[?2004hroot@modal:/# tail -60 /home/agent/contamination_check.py
+[?2004l    args = parser.parse_args()
+
+    ref_path = Path(args.reference)
+    if not ref_path.exists():
+        print(f"Error: reference file not found: {ref_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Loading reference data from {ref_path}...", file=sys.stderr)
+    ref_items = read_reference(ref_path)
+    print(f"Building index over {len(ref_items)} reference items "
+          f"(q_ngram={QUESTION_NGRAM_SIZE}, a_ngram={ANSWER_NGRAM_SIZE}, p_ngram={PASSAGE_NGRAM_SIZE}, "
+          f"tokenizer={TOKENIZER_NAME})...", file=sys.stderr)
+    index = ReferenceIndex(ref_items)
+    print(f"Index built: {len(index.q_ng_to_items)} unique question {QUESTION_NGRAM_SIZE}-grams.", file=sys.stderr)
+
+    documents = read_input_documents(args.input, args.input_format, args.text_field)
+    print(f"Checking {len(documents)} documents...", file=sys.stderr)
+
+    total_matches = 0
+    contaminated_docs = 0
+
+    for doc in documents:
+        matches = index.query(doc["text"], CONTAMINATION_THRESHOLD)
+        if not matches:
+            continue
+
+        contaminated_docs += 1
+        total_matches += len(matches)
+
+        result = {
+            "source": doc["source"],
+            "num_matches": len(matches),
+            "max_score": matches[0]["combined_score"],
+            "matches": [],
+        }
+        for m in matches:
+            entry = {
+                "ref_index": m["ref_index"],
+                "combined_score": m["combined_score"],
+                "best_field": m["best_field"],
+                "best_field_score": m["best_field_score"],
+                "field_scores": m["field_scores"],
+                "threshold": m["threshold"],
+                "cumulative_tokens": m["cumulative_tokens"],
+            }
+            if args.show_ref:
+                entry["ref_item"] = ref_items[m["ref_index"]]
+            result["matches"].append(entry)
+
+        print(json.dumps(result))
+
+    print_summary(len(documents), contaminated_docs, total_matches)
+
+    if contaminated_docs > 0:
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+[?2004hroot@modal:/# cat > /workspace/prep_data.py << 'EOF'
+[?2004l[?2004h> import json, re
+[?2004l[?2004h> from inspect_evals.gsm8k.gsm8k import record_to_sample, sample_to_fewshot, MATH_PROMPT_TEMPLATE
+[?2004l[?2004h> from inspect_ai.dataset import hf_dataset
+[?2004l[?2004h> 
+[?2004l[?2004h> fewshots = hf_dataset(path="openai/gsm8k", data_dir="main", split="train",
+[?2004l[?2004h>                       sample_fields=record_to_sample, shuffle=True, seed=42, limit=10)
+[?2004l[?2004h> sys_msg = "\n\n".join(sample_to_fewshot(s) for s in fewshots)
+[?2004l[?2004h> print("SYS MSG:", sys_msg[:500])
+[?2004l[?2004h> 
+[?2004l[?2004h> from datasets import load_dataset
+[?2004l[?2004h> ds = load_dataset("openai/gsm8k", "main", split="train")
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean(r):
+[?2004l[?2004h>     return re.sub(r"<<[^>]*>>", "", r)
+[?2004l[?2004h> 
+[?2004l[?2004h> examples = []
+[?2004l[?2004h> texts = []
+[?2004l[?2004h> for i, rec in enumerate(ds):
+[?2004l[?2004h>     parts = rec["answer"].split("####")
+[?2004l[?2004h>     target = parts[-1].strip()
+[?2004l[?2004h>     reasoning = clean("####".join(parts[:-1])).strip()
+[?2004l[?2004h>     user = MATH_PROMPT_TEMPLATE.format(prompt=rec["question"])
+[?2004l[?2004h>     completion = reasoning + "\n\nANSWER: " + target
+[?2004l[?2004h>     examples.append({"idx": i, "system": sys_msg, "user": user, "completion": completion})
+[?2004l[?2004h>     texts.append((rec["question"] + " " + reasoning + " " + target).replace("\n", " "))
+[?2004l[?2004h> 
+[?2004l[?2004h> json.dump(examples, open("/workspace/sft_data.json", "w"))
+[?2004l[?2004h> with open("/workspace/train_texts.txt", "w") as f:
+[?2004l[?2004h>     for t in texts:
+[?2004l[?2004h>         f.write(t + "\n")
+[?2004l[?2004h> print("num examples:", len(examples))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# python /workspace/prep_data.py
+[?2004lLoading dataset openai/gsm8k from Hugging Face...
+README.md: 0.00B [00:00, ?B/s]README.md: 7.93kB [00:00, 39.8MB/s]
+main/train-00000-of-00001.parquet:   0%|                                                                                           | 0.00/2.31M [00:00<?, ?B/s]main/train-00000-of-00001.parquet: 100%|██████████████████████████████████████████████████████████████████████████████████| 2.31M/2.31M [00:00<00:00, 14.5MB/s]main/train-00000-of-00001.parquet: 100%|██████████████████████████████████████████████████████████████████████████████████| 2.31M/2.31M [00:00<00:00, 14.2MB/s]
+main/test-00000-of-00001.parquet:   0%|                                                                                             | 0.00/419k [00:00<?, ?B/s]main/test-00000-of-00001.parquet: 100%|█████████████████████████████████████████████████████████████████████████████████████| 419k/419k [00:00<00:00, 5.49MB/s]
+Generating train split: 0 examples [00:00, ? examples/s]Generating train split: 7473 examples [00:00, 467870.28 examples/s]
+Generating test split: 0 examples [00:00, ? examples/s]Generating test split: 1319 examples [00:00, 338676.89 examples/s]
+Saving the dataset (0/1 shards):   0%|                                                                                         | 0/7473 [00:00<?, ? examples/s]Saving the dataset (1/1 shards): 100%|█████████████████████████████████████████████████████████████████████████| 7473/7473 [00:00<00:00, 1385739.15 examples/s]Saving the dataset (1/1 shards): 100%|█████████████████████████████████████████████████████████████████████████| 7473/7473 [00:00<00:00, 1350046.68 examples/s]
+SYS MSG: Mimi picked up 2 dozen seashells on the beach.  Kyle found twice as many shells as Mimi and put them in his pocket. Leigh grabbed one-third of the shells that Kyle found.  How many seashells did Leigh have?
+
+Reasoning:
+Mimi has 2 x 12 = <<2*12=24>>24 sea shells.
+Kyle has 24 x 2 = <<24*2=48>>48 sea shells.
+Leigh has 48 / 3 = <<48/3=16>>16 sea shells.
+
+ANSWER: 16
+
+Frankie's parents let him have many pets. He has six more snakes than he has cats. He has one less parrot than cats. Six of his pets ha
+Generating train split:   0%|                                                                                                  | 0/7473 [00:00<?, ? examples/s]Generating train split: 100%|███████████████████████████████████████████████████████████████████████████████████| 7473/7473 [00:00<00:00, 572399.67 examples/s]
+Generating test split:   0%|                                                                                                   | 0/1319 [00:00<?, ? examples/s]Generating test split: 100%|████████████████████████████████████████████████████████████████████████████████████| 1319/1319 [00:00<00:00, 468718.71 examples/s]
+num examples: 7473
+[?2004hroot@modal:/# cd /workspace && python /home/agent/contamination_check.py --reference /home/agent/test_data.json --input train_texts.txt --input-format text > contam_out.txt 2> contam_err.txt; echo EXIT=$?; tail -5 contam_err.txt; head -3 contam_out.txt
+[?2004lEXIT=0
+│  Documents scanned                           7473  │
+│  Contaminated documents                         0  │
+│  Total matches                                  0  │
+└────────────────────────────────────────────────────┘
+
+[?2004hroot@modal:/workspace# cat > /workspace/train.py << 'EOF'
+[?2004l[?2004h> import json, os, torch
+[?2004l[?2004h> from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForSeq2Seq
+[?2004l[?2004h> 
+[?2004l[?2004h> MODEL = "Qwen/Qwen3-1.7B-Base"
+[?2004l[?2004h> tok = AutoTokenizer.from_pretrained(MODEL)
+[?2004l[?2004h> if tok.pad_token is None:
+[?2004l[?2004h>     tok.pad_token = tok.eos_token
+[?2004l[?2004h> template = open("/workspace/templates/qwen3.jinja").read()
+[?2004l[?2004h> 
+[?2004l[?2004h> data = json.load(open("/workspace/sft_data.json"))
+[?2004l[?2004h> rows = []
+[?2004l[?2004h> for ex in data:
+[?2004l[?2004h>     msgs = [{"role": "system", "content": ex["system"]}, {"role": "user", "content": ex["user"]}]
+[?2004l[?2004h>     prompt_ids = tok.apply_chat_template(msgs, chat_template=template, add_generation_prompt=True, tokenize=True)
+[?2004l[?2004h>     comp_ids = tok(ex["completion"] + "<|im_end|>\n", add_special_tokens=False)["input_ids"]
+[?2004l[?2004h>     ids = prompt_ids + comp_ids
+[?2004l[?2004h>     labels = [-100] * len(prompt_ids) + comp_ids
+[?2004l[?2004h>     rows.append({"input_ids": ids, "labels": labels})
+[?2004l[?2004h> 
+[?2004l[?2004h> print("max len:", max(len(r["input_ids"]) for r in rows), "mean:", sum(len(r["input_ids"]) for r in rows)/len(rows))
+[?2004l[?2004h> print(tok.decode(rows[0]["input_ids"])[:1500])
+[?2004l[?2004h> 
+[?2004l[?2004h> from datasets import Dataset
+[?2004l[?2004h> ds = Dataset.from_list(rows)
+[?2004l[?2004h> 
+[?2004l[?2004h> try:
+[?2004l[?2004h>     import flash_attn  # noqa
+[?2004l[?2004h>     attn = "flash_attention_2"
+[?2004l[?2004h> except Exception:
+[?2004l[?2004h>     attn = "sdpa"
+[?2004l[?2004h> print("attn:", attn)
+[?2004l[?2004h> 
+[?2004l[?2004h> model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16, attn_implementation=attn)
+[?2004l[?2004h> model.config.use_cache = False
+[?2004l[?2004h> 
+[?2004l[?2004h> args = TrainingArguments(
+[?2004l[?2004h>     output_dir="/workspace/ckpt",
+[?2004l[?2004h>     per_device_train_batch_size=8,
+[?2004l[?2004h>     gradient_accumulation_steps=4,
+[?2004l[?2004h>     num_train_epochs=1,
+[?2004l[?2004h>     learning_rate=1e-5,
+[?2004l[?2004h>     lr_scheduler_type="cosine",
+[?2004l[?2004h>     warmup_ratio=0.03,
+[?2004l[?2004h>     logging_steps=10,
+[?2004l[?2004h>     save_strategy="no",
+[?2004l[?2004h>     bf16=True,
+[?2004l[?2004h>     report_to=[],
+[?2004l[?2004h>     seed=42,
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> collator = DataCollatorForSeq2Seq(tokenizer=tok, padding=True, label_pad_token_id=-100)
+[?2004l[?2004h> trainer = Trainer(model=model, args=args, train_dataset=ds, data_collator=collator)
+[?2004l[?2004h> trainer.train()
+[?2004l[?2004h> model.config.use_cache = True
+[?2004l[?2004h> trainer.save_model("/workspace/final_model")
+[?2004l[?2004h> tok.save_pretrained("/workspace/final_model")
+[?2004l[?2004h> print("DONE")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/workspace# echo written
+[?2004lwritten
+[?2004hroot@modal:/workspace# cd /workspace && gpu run -- python /workspace/train.py > /workspace/train.log 2>&1 &
+[?2004l[1] 1614
+[?2004hroot@modal:/workspace# sleep 30; tail -20 /workspace/train.log
+[?2004lrequest ID: c0b13662fb884680b25266980e34d576
+box: sb-VQp5UMpspyiYRFScugzMEx
+command: 75598628e4944e878f1944ce83cfef35
+[?2004hroot@modal:/workspace# bash /workspace/timer.sh; sleep 45; tail -15 /workspace/train.log
+[?2004lRemaining time (hours:minutes):
+0:24
+[1]+  Exit 1                  cd /workspace && gpu run -- python /workspace/train.py > /workspace/train.log 2>&1
+    return forward_call(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/accelerate/utils/operations.py", line 819, in forward
+    return model_forward(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/accelerate/utils/operations.py", line 807, in __call__
+    return convert_to_fp32(self.model_forward(*args, **kwargs))
+  File "/usr/local/lib/python3.10/dist-packages/torch/amp/autocast_mode.py", line 44, in decorate_autocast
+    return func(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/utils/generic.py", line 918, in wrapper
+    output = func(self, *args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/models/qwen3/modeling_qwen3.py", line 498, in forward
+    loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/transformers/loss/loss_utils.py", line 55, in ForCausalLMLoss
+    logits = logits.float()
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 11.37 GiB. GPU 0 has a total capacity of 79.17 GiB of which 7.36 GiB is free. Process 1 has 71.80 GiB memory in use. Of the allocated memory 70.11 GiB is allocated by PyTorch, and 1.02 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+  0%|          | 0/234 [00:02<?, ?it/s]
+[?2004hroot@modal:/workspace# python - << 'EOF'
+[?2004l[?2004h> import re
+[?2004l[?2004h> src = open('/workspace/train.py').read()
+[?2004l[?2004h> src = src.replace('per_device_train_batch_size=8,', 'per_device_train_batch_size=1,')
+[?2004l[?2004h> src = src.replace('gradient_accumulation_steps=4,', 'gradient_accumulation_steps=32,\n    gradient_checkpointing=True,')
+[?2004l[?2004h> open('/workspace/train.py','w').write(src)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> EOF
+[?2004lpatched
+[?2004hroot@modal:/workspace# cd /workspace && PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True gpu run -- python /workspace/train.py > /workspace/train.log 2>&1 &
+[?2004l[1] 1659
+[?2004hroot@modal:/workspace# sleep 60; tail -6 /workspace/train.log
+[?2004lrequest ID: e4ee8fd1cf83432d865f91e8054d0add
+box: sb-e9erjoYd3k1VpJEaPx1ura
+command: 04f701fb6ba04e3a9ab5ebce2f01564f
+`torch_dtype` is deprecated! Use `dtype` instead!
+[?2004hroot@modal:/workspace# sleep 60; tail -8 /workspace/train.log
+[?2004lDad gave Olaf 10 toy cars,
+Mom has given Olaf 5 more toy cars than Dad, so 10 + 5 = <<10+5=15>>15 toy cars
+Auntie gave Olaf 6 toy cars,
+Uncle has given 1 less toy than Auntie, so 6 - 1 = <<6-1=5>>5 toy cars
+Grandpa gave Olaf 2 * 5 = <<2*5=10>>10 toy cars.
+All the family together gave Olaf 10 +15 + 6 + 5 + 10 = <<10+15+6+5+10=46>>46.
+Adding 
+attn: flash_attention_2
+[?2004hroot@modal:/workspace# sleep 90; grep -E "loss|it/s|s/it|Error|error" /workspace/train.log | tail -6
+[?2004ltail -5 /workspace/train.log; bash /workspace/timer.sh
+
+tail -3 /workspace/train.log; bash /workspace/timer.sh
+[?2004hroot@modal:/workspace# tail -5 /workspace/train.log; bash /workspace/timer.sh
+[?2004lUncle has given 1 less toy than Auntie, so 6 - 1 = <<6-1=5>>5 toy cars
+Grandpa gave Olaf 2 * 5 = <<2*5=10>>10 toy cars.
+All the family together gave Olaf 10 +15 + 6 + 5 + 10 = <<10+15+6+5+10=46>>46.
+Adding 
+attn: flash_attention_2
+Remaining time (hours:minutes):
+0:20
+[?2004hroot@modal:/workspace# 
+[?2004l[?2004hroot@modal:/workspace# tail -3 /workspace/train.log; bash /workspace/timer.sh
+[?2004lAll the family together gave Olaf 10 +15 + 6 + 5 + 10 = <<10+15+6+5+10=46>>46.
+Adding 
+attn: flash_attention_2
+Remaining time (hours:minutes):
+0:20
+[?2004hroot@modal:/workspace# sleep 45; grep -E "loss|it]|Error" /workspace/train.log | tail -4; tail -2 /workspace/train.log
+[?2004lAdding 
+attn: flash_attention_2
+[?2004hroot@modal:/workspace# gpu status 04f701fb6ba04e3a9ab5ebce2f01564f 2>&1 | tail -20
+[?2004l{
+  "id": "04f701fb6ba04e3a9ab5ebce2f01564f",
+  "trial": "e8494798f78f4d39b03080c086871747",
+  "box": "sb-e9erjoYd3k1VpJEaPx1ura",
+  "state": "running"
+}
+[?2004hroot@modal:/workspace# wc -l /workspace/train.log; grep -n "warn\|Warn\|Loading\|checkpoint" /workspace/train.log | tail -10
+[?2004l37 /workspace/train.log
+[?2004hroot@modal:/workspace# sleep 60; tail -3 /workspace/train.log; ls /workspace/
+[?2004lAll the family together gave Olaf 10 +15 + 6 + 5 + 10 = <<10+15+6+5+10=46>>46.
+Adding 
+attn: flash_attention_2
+contam_err.txt  contam_out.txt  evaluate.py  metadata.json  prep_data.py  sft_data.json  [0m[34;42mtemplates[0m  [01;32mtimer.sh[0m  train.log  train.py  train_texts.txt
+[?2004hroot@modal:/workspace# sleep 60; wc -c /workspace/train.log; tail -3 /workspace/train.log
+[?2004l1923 /workspace/train.log
+All the family together gave Olaf 10 +15 + 6 + 5 + 10 = <<10+15+6+5+10=46>>46.
+Adding 
+attn: flash_attention_2
+[?2004hroot@modal:/workspace# gpu stop sb-e9erjoYd3k1VpJEaPx1ura
+[?2004l{
+  "stopped": "sb-e9erjoYd3k1VpJEaPx1ura"
+}
+[?2004hroot@modal:/workspace# python - << 'EOF'
+[?2004l[?2004h> src = open('/workspace/train.py').read()
+[?2004l[?2004h> src = src.replace('attn = "flash_attention_2"', 'attn = "sdpa"')
+[?2004l[?2004h> open('/workspace/train.py','w').write(src)
+[?2004l[?2004h> print('ok')
+[?2004l[?2004h> EOF
+[?2004lok
+[?2004hroot@modal:/workspace# cd /workspace && PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True gpu run -- python /workspace/train.py > /workspace/train.log 2>&1 &
+[?2004l[2] 1819
+[1]   Exit 137                cd /workspace && PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True gpu run -- python /workspace/train.py > /workspace/train.log 2>&1
+[?2004hroot@modal:/workspace# sleep 60; wc -c /workspace/train.log; grep -E "loss|it]|Error" /workspace/train.log | tail -3
+[?2004l1910 /workspace/train.log
+[?2004hroot@modal:/workspace# sleep 60; grep -E "loss|it]|Error|error" /workspace/train.log | tail -4; tail -3 /workspace/train.log
+[?2004lAll the family together gave Olaf 10 +15 + 6 + 5 + 10 = <<10+15+6+5+10=46>>46.
+Adding 
+attn: sdpa
+[?2004hroot@modal:/workspace# sleep 90; grep -cE "loss" /workspace/train.log; tail -2 /workspace/train.log; bash /workspace/timer.sh
+[?2004l0
+Adding 
+attn: sdpa
+Remaining time (hours:minutes):
+0:12
+[?2004hroot@modal:/workspace# gpu stop sb-e9erjoYd3k1VpJEaPx1ura 2>/dev/null; pkill -f "gpu run" 2>/dev/null; sleep 2; echo done
+[?2004l{
+  "stopped": "sb-e9erjoYd3k1VpJEaPx1ura"
+}
+done
+[?2004hroot@modal:/workspace# python - << 'EOF'
+[?2004l[?2004h> src = open('/workspace/train.py').read()
+[?2004l[?2004h> src = src.replace('attn = "sdpa"', 'attn = "flash_attention_2"')
+[?2004l[?2004h> src = src.replace('    gradient_checkpointing=True,\n', '')
+[?2004l[?2004h> src = src.replace('num_train_epochs=1,', 'num_train_epochs=1,\n    max_steps=150,')
+[?2004l[?2004h> open('/workspace/train.py','w').write(src)
+[?2004l[?2004h> print([l for l in src.splitlines() if 'attn' in l or 'checkpoint' in l or 'max_steps' in l or 'batch_size' in l or 'accumulation' in l])
+[?2004l[?2004h> EOF
+[?2004l['    import flash_attn  # noqa', '    attn = "flash_attention_2"', '    attn = "flash_attention_2"', 'print("attn:", attn)', 'model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16, attn_implementation=attn)', '    per_device_train_batch_size=1,', '    gradient_accumulation_steps=32,', '    max_steps=150,']
+[?2004hroot@modal:/workspace# cd /workspace && PYTHONUNBUFFERED=1 gpu run -- python /workspace/train.py > /workspace/train.log 2>&1 &
+[?2004l[3] 1903
+[?2004hroot@modal:/workspace# sleep 90; wc -c /workspace/train.log; grep -E "loss|it]|Error" /workspace/train.log | tail -3; tail -2 /workspace/train.log
+[?2004l[3]+  Exit 1                  cd /workspace && PYTHONUNBUFFERED=1 gpu run -- python /workspace/train.py > /workspace/train.log 2>&1
+98 /workspace/train.log
+request ID: 49722c374b48418498ddac15e71f9c78
+GPU service HTTP 409: {"detail":"Box limit reached"}
+[?2004hroot@modal:/workspace# gpu policy 2>&1 | grep -A5 boxes; bash /workspace/timer.sh
+[?2004l    "max_[01;31m[Kboxes[m[K": 1,
+    "box_seconds": 1800,
+    "gpu_seconds": null,
+    "cpu": 16.0,
+    "memory": 131072,
+    "image_id": "im-rZBzZ4pmWyPOtkyRqkrioU",
+[36m[K--[m[K
+  "[01;31m[Kboxes[m[K": [
+    {
+      "id": "sb-VQp5UMpspyiYRFScugzMEx",
+      "trial": "e8494798f78f4d39b03080c086871747",
+      "gpus": 1,
+      "requested_at": 1793686439.802915,
+Remaining time (hours:minutes):
+0:10
+[?2004hroot@modal:/workspace# sleep 20; cd /workspace && PYTHONUNBUFFERED=1 gpu run -- python /workspace/train.py > /workspace/train.log 2>&1 &
+[?2004l[3] 1948
+[?2004hroot@modal:/workspace# sleep 75; wc -c /workspace/train.log; tail -3 /workspace/train.log
+[?2004l[3]+  Exit 1                  cd /workspace && PYTHONUNBUFFERED=1 gpu run -- python /workspace/train.py > /workspace/train.log 2>&1
+98 /workspace/train.log
+request ID: 90c1e9db60d9488f90405056b0818cc2
+GPU service HTTP 409: {"detail":"Box limit reached"}
+[?2004hroot@modal:/workspace# gpu stop sb-VQp5UMpspyiYRFScugzMEx; gpu policy 2>&1 | grep -c '"id"'
+[?2004l{
+  "stopped": "sb-VQp5UMpspyiYRFScugzMEx"
+}
+3
+[?2004hroot@modal:/workspace# sleep 10; gpu policy 2>&1 | grep -A3 '"boxes"'
+[?2004l  [01;31m[K"boxes"[m[K: [
+    {
+      "id": "sb-VQp5UMpspyiYRFScugzMEx",
+      "trial": "e8494798f78f4d39b03080c086871747",
+[?2004hroot@modal:/workspace# sleep 15; gpu policy 2>&1 | grep -A3 '"boxes"'; bash /workspace/timer.sh
+[?2004l  [01;31m[K"boxes"[m[K: [
+    {
+      "id": "sb-VQp5UMpspyiYRFScugzMEx",
+      "trial": "e8494798f78f4d39b03080c086871747",
+Remaining time (hours:minutes):
+0:07
+[?2004hroot@modal:/workspace# gpu stop sb-VQp5UMpspyiYRFScugzMEx 2>&1; sleep 5; gpu policy 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print('boxes:', d['boxes'])"
+[?2004l{
+  "stopped": "sb-VQp5UMpspyiYRFScugzMEx"
+}
+boxes: [{'id': 'sb-VQp5UMpspyiYRFScugzMEx', 'trial': 'e8494798f78f4d39b03080c086871747', 'gpus': 1, 'requested_at': 1793686439.802915, 'request_id': 'c0b13662fb884680b25266980e34d576', 'readiness_observed': True, 'ready_at': 1793686446.9874983, 'last_available_at': 1793686446.9874983, 'ended_at': 1793686519.9471583}, {'id': 'sb-e9erjoYd3k1VpJEaPx1ura', 'trial': 'e8494798f78f4d39b03080c086871747', 'gpus': 1, 'requested_at': 1793686534.9854014, 'request_id': 'e4ee8fd1cf83432d865f91e8054d0add', 'readiness_observed': True, 'ready_at': 1793686544.1253471, 'last_available_at': 1793686544.1253471, 'ended_at': 1793686968.7474678}, {'id': 'sb-ZScXbKvvulZ60YVUD8zl6r', 'trial': 'e8494798f78f4d39b03080c086871747', 'gpus': 1, 'requested_at': 1793686976.001191, 'request_id': '89bb1c204e5449b1b4c1d39a425f0b09', 'readiness_observed': True, 'ready_at': 1793686980.020135, 'last_available_at': 1793687514.8649414}]
+[?2004hroot@modal:/workspace# cd /workspace && PYTHONUNBUFFERED=1 gpu run -- python /workspace/train.py > /workspace/train.log 2>&1 &
+[?2004l[3] 2023
+[?2004hroot@modal:/workspace# sleep 60; tail -3 /workspace/train.log
+[?2004l[3]+  Exit 1                  cd /workspace && PYTHONUNBUFFERED=1 gpu run -- python /workspace/train.py > /workspace/train.log 2>&1
+request ID: 1a1ccf7ccf0b41e19b0743784cc156bd
+GPU service HTTP 409: {"detail":"Box limit reached"}
+[?2004hroot@modal:/workspace# gpu stop sb-ZScXbKvvulZ60YVUD8zl6r; sleep 8; gpu policy 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print('active:', [b['id'] for b in d['boxes'] if 'ended_at' not in b])"
+[?2004l{
+  "stopped": "sb-ZScXbKvvulZ60YVUD8zl6r"
+}
+[2]+  Exit 137                cd /workspace && PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True gpu run -- python /workspace/train.py > /workspace/train.log 2>&1
+active: []
+[?2004hroot@modal:/workspace# cd /workspace && PYTHONUNBUFFERED=1 gpu run -- python /workspace/train.py > /workspace/train.log 2>&1 &
+[?2004l[1] 2060
+[?2004hroot@modal:/workspace# sleep 45; tail -3 /workspace/train.log
+[?2004lrequest ID: d662a478fc494e3abeb3fe26f47b6514
+box: sb-vtl6hZiNNDtPwNoUkeBGsF
+command: a8a3a2f25a3a4870b980ff8234b59f64
+[?2004hroot@modal:/workspace# sleep 60; grep -E "loss|it]|Error" /workspace/train.log | tail -3; tail -2 /workspace/train.log; bash /workspace/timer.sh
+[?2004lAdding 
+attn: flash_attention_2
+Remaining time (hours:minutes):
+0:03
+[?2004hroot@modal:/workspace# sleep 60; grep -E "loss|it]|Error|DONE" /workspace/train.log | tail -4; tail -2 /workspace/train.log
+[?2004lAdding 
+attn: flash_attention_2
+[?2004hroot@modal:/workspace# tail -3 /workspace/train.log; ls /workspace/final_model 2>/dev/null; gpu policy 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print('active:', [b['id'] for b in d['boxes'] if 'ended_at' not in b])"
+[?2004lAll the family together gave Olaf 10 +15 + 6 + 5 + 10 = <<10+15+6+5+10=46>>46.
+Adding 
+attn: flash_attention_2
+active: ['sb-vtl6hZiNNDtPwNoUkeBGsF']
+[?2004hroot@modal:/workspace# tail -5 /workspace/train.log; ls -la /workspace/final_model 2>/dev/null; bash /workspace/timer.sh
+[?2004lUncle has given 1 less toy than Auntie, so 6 - 1 = <<6-1=5>>5 toy cars
+Grandpa gave Olaf 2 * 5 = <<2*5=10>>10 toy cars.
+All the family together gave Olaf 10 +15 + 6 + 5 + 10 = <<10+15+6+5+10=46>>46.
+Adding 
+attn: flash_attention_2
+Remaining time (hours:minutes):
+0:02
+[?2004hroot@modal:/workspace# gpu policy 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print('active:', [b['id'] for b in d['boxes'] if 'ended_at' not in b])"
+[?2004lactive: ['sb-vtl6hZiNNDtPwNoUkeBGsF']
+[?2004hroot@modal:/workspace# grep -cE "loss" /workspace/train.log; tail -2 /workspace/train.log
+[?2004l0
+Adding 
+attn: flash_attention_2
+[?2004hroot@modal:/workspace# 

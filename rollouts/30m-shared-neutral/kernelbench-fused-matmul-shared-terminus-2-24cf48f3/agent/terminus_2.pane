@@ -1,0 +1,3597 @@
+[?2004hroot@modal:/# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@modal:/# clear
+[?2004l[H[J[?2004hroot@modal:/# cat /opt/task/reference.py
+[?2004limport torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a matrix multiplication, scaling, and residual addition.
+
+    Args:
+        in_features (int): Number of input features.
+        out_features (int): Number of output features.
+        scaling_factor (float): Scaling factor to apply after matrix multiplication.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.matmul(x)
+        original_x = x.clone().detach()
+        x = x * self.scaling_factor
+        x = x + original_x
+        return x
+
+batch_size = 16384
+in_features = 4096
+out_features = 4096
+scaling_factor = 0.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, scaling_factor][?2004hroot@modal:/# cat /opt/task/starter.py
+[?2004lfrom reference import Model as ModelNew
+[?2004hroot@modal:/# cat /opt/task/evaluate.py
+[?2004l"""Repeated development feedback and independent final KernelBench scoring."""
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
+
+def evaluate(solution: Path, *, correct_trials: int, perf_trials: int):
+    import torch
+    from kernelbench.eval import eval_kernel_against_ref
+
+    reference = Path(__file__).with_name("reference.py")
+    candidate = solution.read_text()
+    result = eval_kernel_against_ref(
+        reference.read_text(),
+        candidate,
+        seed_num=42,
+        num_correct_trials=correct_trials,
+        num_perf_trials=perf_trials,
+        measure_performance=True,
+        timing_method="cuda_event",
+        backend="triton",
+        precision=torch.float32,
+    )
+    if result is None:
+        raise RuntimeError("Native evaluator returned no result; inspect evaluation output")
+    report = result.model_dump()
+    report.update(
+        solution_sha256=hashlib.sha256(candidate.encode()).hexdigest(),
+        reference_sha256=hashlib.sha256(reference.read_bytes()).hexdigest(),
+        timing_unit="milliseconds",
+        correct_trials=correct_trials,
+        perf_trials=perf_trials,
+    )
+    report["speedup"] = (
+        result.ref_runtime / result.runtime
+        if result.compiled and result.correctness and result.runtime > 0 and result.ref_runtime > 0
+        else 0.0
+    )
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("solution", type=Path)
+    parser.add_argument("--correct-trials", type=int, default=5)
+    parser.add_argument("--perf-trials", type=int, default=20)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--reward", type=Path, help="Final verifier's flat numeric reward JSON")
+    args = parser.parse_args()
+    if args.correct_trials < 1 or args.perf_trials < 1:
+        parser.error("Trial counts must be positive")
+    report = evaluate(args.solution, correct_trials=args.correct_trials, perf_trials=args.perf_trials)
+    serialized = json.dumps(report, indent=2, default=str)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(serialized + "\n")
+    if args.reward:
+        args.reward.parent.mkdir(parents=True, exist_ok=True)
+        args.reward.write_text(
+            json.dumps({"speedup": report["speedup"], "correct": int(report["correctness"])})
+        )
+    print(serialized)
+
+
+if __name__ == "__main__":
+    main()
+[?2004hroot@modal:/# python3 -c "import kernelbench.eval as m; print(m.__file__)"
+[?2004l/usr/local/lib/python3.10/dist-packages/kernelbench/eval.py
+[?2004hroot@modal:/# cat /usr/local/lib/python3.10/dist-packages/kernelbench/eval.py
+[?2004l"""
+Helpers for Evaluations
+"""
+
+import hashlib
+import importlib
+import json
+import linecache
+import os, subprocess
+import random
+import sys
+import tempfile
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from typing import Union, Optional
+
+import numpy as np
+import requests
+import torch
+import torch.nn as nn
+from pydantic import BaseModel
+
+from . import timing, dataset
+
+REPO_TOP_PATH = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "../..",
+    )
+)
+KERNEL_BENCH_PATH = os.path.join(REPO_TOP_PATH, "KernelBench")
+
+
+def get_error_name(e: Exception) -> str:
+    """
+    Get the error name, for logging purposes
+    """
+    return f"{e.__class__.__module__}.{e.__class__.__name__}"
+
+
+def fetch_ref_arch_from_problem_id(problem_id: int, dataset: "BaseDataset", with_name=False) -> Union[str, tuple[str, str]]:
+    """
+    Fetches the reference architecture for a given problem_id from the dataset.
+    """
+    if isinstance(problem_id, str):
+        problem_id = int(problem_id)
+
+    problem = dataset.get_problem_by_id(problem_id)
+    ref_arch = problem.code
+    
+    if not with_name:
+        return ref_arch
+    else:
+        # Use problem.name as fallback when path is None (e.g., for HuggingFace datasets)
+        name = problem.path if problem.path is not None else problem.name
+        return (name, ref_arch)
+
+
+def fetch_ref_arch_from_level_problem_id(level, problem_id, with_name=False):
+    kb_dataset = dataset.construct_kernelbench_dataset(level)
+    return fetch_ref_arch_from_problem_id(problem_id, kb_dataset, with_name)
+
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    # NOTE: this only sets on current cuda device
+    torch.cuda.manual_seed(seed)
+
+def get_torch_dtype_from_string(precision: str) -> torch.dtype:
+    """
+    Get the torch dtype for specific precision
+    """
+    if precision == "fp32":
+        return torch.float32
+    elif precision == "fp16":
+        return torch.float16
+    elif precision == "bf16":
+        return torch.bfloat16
+    else: # future, FP8, FP4, etc. support?
+        raise ValueError(f"Invalid precision not supported: {precision}")
+
+def get_tolerance_for_precision(precision: str | torch.dtype) -> float:
+    """
+    Get the tolerance from a string representing the percision.
+    These tolerances are inspired by torchbench (PyTorch Benchmarking Suite): 
+    Reference:
+    https://github.com/pytorch/benchmark/blob/cfd835c35d04513ced9a59bd074eeb21dc8187d7/torchbenchmark/util/env_check.py#L519
+    """
+    if isinstance(precision, str):
+        precision = get_torch_dtype_from_string(precision)
+
+    PRECISION_TOLERANCES = {
+        # By default for fp32, 1e-4 is used according to torchbench.
+        torch.float32: 1e-4,
+        # torchbench states for bf16 and fp16, use 1e-3 as tolerance and 1e-2 if it's too strict. 
+        # @todo: Let user configure own tolerance as an option
+        torch.float16: 1e-2, 
+        torch.bfloat16: 1e-2,
+    }
+    assert precision in PRECISION_TOLERANCES, f"Invalid precision not supported: {precision}"
+    return PRECISION_TOLERANCES[precision]
+    
+
+class KernelExecResult(BaseModel):
+    """
+    Single Kernel Execution
+    """
+    # Execution
+    compiled: bool = False
+    correctness: bool = False
+    metadata: dict = {} # NOTE: to include warning if any
+
+    # Timing
+    runtime: float = -1.0  # in us, only recorded if we decide to measure performance
+    runtime_stats: dict = {}  # only recorded if we decide to measure performance
+
+    # new: added ref time either through fetching prev runs or through execution
+    # could do eager for level 1 and compile for level 2 and 3
+    ref_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
+    ref_runtime_stats: dict = {} # only recorded if we decide to measure performance
+
+
+def load_original_model_and_inputs(
+    model_original_src: str, context: dict
+) -> tuple[nn.Module, callable, callable]:
+    """
+    Load class from original NN.module pytorch code
+    this is pytorch reference and we feed that to model to see if there will be any improvement
+    """
+
+    try:
+        compile(model_original_src, "<string>", "exec")
+    except SyntaxError as e:
+        print(f"Syntax Error in original code {e}")
+        return None
+
+    try:
+        exec(model_original_src, context)  # expose to current namespace
+    except Exception as e:
+        print(f"Error in executing original code {e}")
+        return None
+
+    # these should be defined in the original model code and present in the context
+    get_init_inputs_fn = context.get("get_init_inputs")
+    get_inputs_fn = context.get("get_inputs")
+    Model = context.get("Model")
+    return (Model, get_init_inputs_fn, get_inputs_fn)
+
+
+def load_custom_model_with_tempfile(model_custom_src, entry_point="ModelNew"):
+    """
+    Writes the provided Python code string to a temporary .py file,
+    dynamically imports the module so we can access the modified model class.
+
+    Returns both a Model class and the temporary file. The temporary file must be
+    deleted manually be the caller.
+
+    This is a hack that is needed for triton code as compile / exec do not play well
+    with the @triton.jit decorator.
+    """
+
+    # Create a temporary named file with a .py extension
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp_file:
+        # Write the code string into the file
+        tmp_file.write(model_custom_src)
+        # Capture the path to the file
+        tempfile_path = tmp_file.name
+        temp_file = tmp_file
+
+    # Create a module specification pointing to our temp file
+    spec = importlib.util.spec_from_file_location("temp_module", tempfile_path)
+    # Create a new module based on that spec
+    temp_module = importlib.util.module_from_spec(spec)
+    # Execute the code in the module's namespace
+    spec.loader.exec_module(temp_module)
+
+    ModelNew = getattr(temp_module, entry_point)
+
+    # Return the object (class, function, etc.) that was defined in the code
+    return ModelNew, temp_file
+
+
+def load_custom_model(
+    model_custom_src: str, context: dict, build_directory: str = None
+) -> nn.Module:
+    """
+    Load class from custom NN.module pytorch code
+    this is the code output by LLM with calls to custom cuda kernels
+    """
+    if build_directory:
+        context["BUILD_DIRECTORY"] = build_directory
+        # Add import at the start of the source code
+        model_custom_src = (
+            "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_directory}'\n"
+        ) + model_custom_src
+
+    try:
+        compile(model_custom_src, "<string>", "exec")
+        exec(model_custom_src, context)
+        # DANGER: need to delete refernece from global namespace
+    except SyntaxError as e:
+        print(f"Syntax Error in custom generated code or Compilation Error {e}")
+        return None
+
+    ModelNew = context.get("ModelNew")
+    return ModelNew
+
+
+def _cleanup_cuda_extensions():
+    """Helper function to cleanup compiled CUDA extensions"""
+    # SIMON NOTE: is this necessary?
+    import shutil
+
+    torch_extensions_path = os.path.join(
+        os.path.expanduser("~"), ".cache", "torch_extensions"
+    )
+    if os.path.exists(torch_extensions_path):
+        shutil.rmtree(torch_extensions_path)
+
+
+def graceful_eval_cleanup(
+    curr_context: dict,
+    device: torch.device,
+    tempfile: tempfile.NamedTemporaryFile = None,
+):
+    """
+    Clean up env, gpu cache, and compiled CUDA extensions after evaluation
+    """  # delete ran-specific function definitions before next eval run
+    del curr_context
+    # Clear CUDA cache and reset GPU state
+    with torch.cuda.device(device):
+        torch.cuda.empty_cache()
+
+        # does this help?
+        torch.cuda.reset_peak_memory_stats(device=device)
+
+        torch.cuda.synchronize(
+            device=device
+        )  # Wait for all CUDA operations to complete
+    if tempfile:
+        tempfile.close()
+        os.remove(tempfile.name)
+
+    # _cleanup_cuda_extensions() # SIMON NOTE: is this necessary?
+
+
+def build_compile_cache_legacy(
+    custom_model_src: str,
+    verbose: bool = False,
+    build_dir: os.PathLike = None,
+) -> tuple[bool, str, str]:
+    """
+    Try to build the compiled cuda code for sample and store in the cache directory
+    Should be able to run on CPUs to do this massively in parallel
+
+    Don't limit ninja to set default number of workers, let it use all the cpu cores possible
+
+    NOTE: currently stdout_buffer does not capture all the compiler warning and failure messages
+    Returns:
+        tuple[bool, str]: whether compilation is successful, stdout content as string
+    """
+    context = {}
+    stdout_buffer = StringIO()
+
+    if verbose:
+        print("[Compilation] Pre-compile custom cuda binaries")
+
+    try:
+        os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
+        # sys.stdout.flush()
+
+        # Capture stdout during compilation
+        with redirect_stdout(stdout_buffer), redirect_stderr(stdout_buffer):
+            load_custom_model(custom_model_src, context, build_dir)
+            # sys.stdout.flush()
+
+        if verbose:
+            print(f"[Compilation] Compilation Successful, saved cache at: {build_dir}")
+    except Exception as e:
+        print(
+            f"[Compilation] Failed to compile custom CUDA kernel. Unable to cache, \nError: {e}"
+        )
+        return False, stdout_buffer.getvalue(), str(e)
+
+    return True, stdout_buffer.getvalue(), None
+
+
+def build_compile_cache(
+    custom_model_src: str,
+    verbose: bool = False,
+    build_dir: os.PathLike = None,
+) -> tuple[bool, str, str]:
+    """
+    Try to build the compiled cuda code for sample and store in the cache directory
+    Should be able to run on CPUs to do this massively in parallel
+
+    Don't limit ninja to set default number of workers, let it use all the cpu cores possible
+    # try do this with a subprocess
+    NOTE: currently stdout_buffer does not capture all the compiler warning and failure messages
+    Returns:
+        tuple[bool, str]: whether compilation is successful, stdout content as string
+    """
+    context = {}
+    stdout_buffer = StringIO()
+
+    if verbose:
+        print("[Compilation] Pre-compile custom cuda binaries")
+
+    try:
+        os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
+        # sys.stdout.flush()
+
+        # Capture stdout during compilation
+        with redirect_stdout(stdout_buffer), redirect_stderr(stdout_buffer):
+            load_custom_model(custom_model_src, context, build_dir)
+            # sys.stdout.flush()
+
+        if verbose:
+            print(f"[Compilation] Compilation Successful, saved cache at: {build_dir}")
+    except Exception as e:
+        print(
+            f"[Compilation] Failed to compile custom CUDA kernel. Unable to cache, \nError: {e}"
+        )
+        return False, stdout_buffer.getvalue(), str(e)
+
+    return True, stdout_buffer.getvalue(), None
+
+
+def build_compile_cache_with_capturing(
+    custom_model_src: str, verbose: bool = False, build_dir: os.PathLike = None
+) -> tuple[int, str, str]:
+    """
+    Write a temporary python file to compile the custom model on CPU
+    Captures the return code, stdout, and stderr
+    This works for capturing, build_compile_cache does not
+    """
+    if build_dir:
+        # Add import at the start of the source code
+        custom_model_src = (
+            "import os\n" f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_dir}'\n"
+        ) + custom_model_src
+
+    kernel_hash = hash(custom_model_src)
+    # tmp is a temp python file we write to for compilation
+    tmp = os.path.join(build_dir, f"tmp_{kernel_hash}.py")
+    os.makedirs(os.path.dirname(tmp), exist_ok=True)
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(custom_model_src)
+
+    # Execute the temporary Python file and capture output
+    process = subprocess.Popen(
+        ["python", tmp], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    stdout, stderr = process.communicate()
+    returncode = process.returncode
+
+    # Clean up temporary file
+    os.remove(tmp)
+
+    if verbose:
+        print("[CPU Precompile] return code: ", returncode)
+        print("[CPU Precompile] stdout: \n", stdout.decode("utf-8"))
+        print("[CPU Precompile] stderr: \n", stderr.decode("utf-8"))
+
+    return returncode, stdout.decode("utf-8"), stderr.decode("utf-8")
+
+
+def _process_input_tensor(input, device, backend="cuda", precision=torch.float32):
+    """
+    Helper function to move tensors to the correct device and apply backend-specific dtype casting.
+    
+    Args:
+        input: Input tensor or non-tensor value
+        device: Target CUDA device
+        backend: Backend type (e.g., 'cuda', 'triton', 'cute')
+        precision: torch.dtype 
+    Returns:
+        Processed tensor on correct device with correct dtype, or original value if not a tensor
+    """
+
+    # sometimes things like init inputs are floats (like in the case of labels / targets, classification losses, etc.) 
+    if not isinstance(input, torch.Tensor):
+        return input
+    
+    # cast to the desired percision dtype for activations
+    input_tensor = input.to(dtype=precision)
+    
+    # Default for all other backends and float types
+    return input_tensor.to(device=device)
+
+
+def eval_kernel_against_ref(
+    original_model_src: str,
+    custom_model_src: str,
+    seed_num: int = 42,
+    num_correct_trials: int = 1,
+    num_perf_trials: int = 10,
+    measure_performance: bool = False,
+    timing_method: str = "cuda_event", # see timing.py
+    verbose: bool = False,
+    build_dir: os.PathLike = None,
+    device: Union[torch.device, int] = (
+        torch.cuda.current_device() if torch.cuda.is_available() else None
+    ),  # have to run on GPU
+    backend: str = "cuda",  # can be 'cuda', 'triton', 'tilelang', or 'cute'
+    precision: torch.dtype = torch.float32,
+
+    # Guard against potential reward hacking [optional but ongoing enhancement]
+    check_for_excessive_speedup: bool = True,
+    excessive_speedup_threshold: float = 10, # flag if the kernel is more than <excessive_speedup_threshold>x faster than the reference
+) -> KernelExecResult:
+    """
+    Evaluate the custom kernel against the original model
+
+    NOTE: we are thinking about refactor this to be more modularized 
+    and we can add more checks as our other ongiong PRs are working on
+
+    num_correct_trials: number of trials to initialize different random inputs; correctness pass only if all trials pass
+    num_perf_trials: run the evalutation many times to take the average
+    device: GPU (cuda) device to run the evalutation on
+    backend: str, one of 'cuda', 'triton', 'tilelang', or 'cute'
+    precision: torch.dtype for computation (note: tilelang only supports fp16)
+    timing_method: str, method to time kernel, see timing.py for more details 
+
+    ONGOING EFFORT to refactor and modularize this, and adding more tests for eval.
+    """
+    # TODO: check device is busy
+    assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
+    
+    # Backend-GPU vendor validation
+    from .utils import get_gpu_vendor
+    vendor = get_gpu_vendor(device)
+    backend_lower = backend.lower()
+    # HIP is AMD-only
+    if backend_lower == "hip" and vendor != "amd":
+        raise ValueError(f"HIP backend requires AMD GPU, got {vendor}")
+    # cuda/cute/thunderkittens are NVIDIA-only (triton/tilelang work on both)
+    if backend_lower in ["cuda", "cute", "thunderkittens"] and vendor == "amd":
+        raise ValueError(f"{backend} backend requires NVIDIA GPU, got AMD")
+    
+    if backend_lower == "tilelang":
+        assert precision == torch.float16 or precision == torch.bfloat16, "TileLang only supports fp16 or bfloat16"
+    
+    torch.set_printoptions(
+        precision=4,  # Decimal places
+        threshold=10,  # Total number of elements before truncating
+        edgeitems=3,  # Number of elements at beginning and end of dimensions
+        linewidth=80,  # Maximum width before wrapping
+    )
+
+    # set CUDA device
+    torch.cuda.set_device(device)
+    
+    # Backends that use tempfile approach and need CUDA_VISIBLE_DEVICES
+    # TileLang, Triton, and CuTe all use tempfile for proper module loading
+    uses_tempfile = backend.lower() in ["triton", "tilelang", "cute"]
+    
+    metadata = {}  # for storing result metadata
+    metadata["hardware"] = torch.cuda.get_device_name(device=device)
+    metadata["device"] = str(device)  # for debugging
+
+    if uses_tempfile:
+        # need to set env var for triton/cute code to guarantee no wrong device shenanigans
+        if isinstance(device, int):
+            device_num = device
+        elif isinstance(device, torch.device):
+            assert (
+                device.type == "cuda"
+            ), "CUDA is not availible on device, cannot run Eval"
+            device_num = device.index
+        else:
+            raise ValueError(
+                f"device must be an int or torch.device, got {type(device)}"
+            )
+        # NVIDIA uses CUDA_VISIBLE_DEVICES, AMD uses HIP_VISIBLE_DEVICES
+        if vendor == "amd":
+            os.environ["HIP_VISIBLE_DEVICES"] = str(device_num)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(device_num)
+    context = {}
+
+    if verbose:
+        print(f"[Eval] Start Evalulation! on device: {device}")
+        print("[Eval] Loading Original Model")
+
+    Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
+        original_model_src, context
+    )
+    set_seed(seed_num)  # set seed for reproducible input
+    init_inputs = get_init_inputs()
+    
+    # Convert inputs to appropriate dtypes for GPU computation
+    init_inputs = [_process_input_tensor(x, device, backend, precision) for x in init_inputs]
+    
+    with torch.no_grad():
+        set_seed(seed_num)  # set seed for reproducible weights
+        original_model = Model(*init_inputs)
+        assert hasattr(original_model, "forward")
+        if verbose:
+            print("[Eval] Original Model Loaded")
+    
+    if verbose:
+        print("[Eval] Loading and Compiling New Model with Custom CUDA Kernel")
+
+    # this is where compilation happens
+    try:
+        os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
+        tempfile = None
+        # add hash for later to distinguish between multi-turn kernels
+        
+        backend_lower = backend.lower()
+        if backend_lower in ["triton", "tilelang", "cute"]:
+            # Use tempfile approach for triton, tilelang, and cute
+            # These DSLs require proper module import for JIT decorators to work
+            ModelNew, tempfile = load_custom_model_with_tempfile(
+                custom_model_src, entry_point="ModelNew"
+            )
+        else:
+            # Default CUDA backend
+            ModelNew = load_custom_model(custom_model_src, context, build_dir)
+        torch.cuda.synchronize(device=device)  # not sure if this is too much
+    except Exception as e:
+        print(
+            f"Failed to compile custom CUDA kernel: Record as compilation failure. \nError: {e}"
+        )
+        # TODO: add metadata for compilation error (how to we get the compilation error message?)
+
+        if "lock" in str(e) or "No such file or directory" in str(e):
+            # this is a lock file error, likely due to concurrent compilation
+            # this does not necessarily mean the compilation failed, but we should retry
+            print(
+                f"[Eval] Lock file error during compilation, Please retry. Error: {e}"
+            )
+            graceful_eval_cleanup(context, device, tempfile)
+            return None
+        else:
+            metadata["compilation_error_name"] = get_error_name(e)
+            metadata["compilation_error"] = e
+            graceful_eval_cleanup(context, device, tempfile)
+            return KernelExecResult(
+                compiled=False, metadata=metadata
+            )  # skip further steps
+
+    # Check if ModelNew was successfully loaded (load_custom_model returns None on syntax errors)
+    if ModelNew is None:
+        print(
+            "Failed to load custom model: Syntax error or ModelNew not found in generated code. Record as compilation failure."
+        )
+        metadata["compilation_error_name"] = "SyntaxError"
+        metadata["compilation_error"] = "Syntax error in custom generated code or ModelNew not found"
+        graceful_eval_cleanup(context, device, tempfile)
+        return KernelExecResult(
+            compiled=False, metadata=metadata
+        )  # skip further steps
+
+    # at this point we passed compilation
+    try:
+        with torch.no_grad():
+            set_seed(seed_num)  # set seed for reproducible weights
+            custom_model = ModelNew(*init_inputs)
+            assert hasattr(custom_model, "forward")
+            original_model = original_model.to(device=device, dtype=precision)
+            custom_model = custom_model.to(device=device, dtype=precision)
+            torch.cuda.synchronize(device=device)
+        if verbose:
+            print("[Eval] New Model with Custom CUDA Kernel Loaded")
+    except RuntimeError as e:
+        print(
+            f"Failed to load custom CUDA kernel; Compiled but not able to run, count as runtime error. \nError: {e}"
+        )
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        graceful_eval_cleanup(context, device, tempfile)
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        return KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )  # skip further steps
+
+    kernel_exec_result = None
+
+    # Check Correctness
+    if verbose:
+        print("[Eval] Checking Correctness")
+    try:
+        kernel_exec_result = run_and_check_correctness(
+            original_model,
+            custom_model,
+            get_inputs,
+            metadata=metadata,
+            num_correct_trials=num_correct_trials,
+            verbose=verbose,
+            seed=seed_num,
+            device=device,
+            backend=backend,
+            precision=precision,
+        )
+    except Exception as e:
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        kernel_exec_result = KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )
+
+    # Measure Performance [Optional] | conditioned on compilation + correctness + no exception so far
+    if measure_performance:
+        try:
+            if kernel_exec_result and kernel_exec_result.correctness:
+                if verbose:
+                    print("[Eval] Measuring Performance as Sample is Correct")
+
+                torch.cuda.synchronize(device=device)
+                set_seed(seed_num)
+                inputs = get_inputs()
+                # Convert inputs for performance measurement
+                inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+                
+                model_new = custom_model.to(device=device, dtype=precision)
+                torch.cuda.synchronize(device=device)
+
+                # support multiple timing backend
+                timing_fn = timing.get_timing_function(timing_method)
+                elapsed_times = timing_fn(
+                    model_new,
+                    inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                runtime_stats = timing.get_timing_stats(elapsed_times, device=device)
+
+                if verbose:
+                    print(f"[Eval] Performance Stats: {runtime_stats}")
+                kernel_exec_result.runtime = runtime_stats["mean"]
+                kernel_exec_result.runtime_stats = runtime_stats
+
+        except Exception as e:
+            if verbose:
+                print(f"[Eval] Error in Measuring Performance: {e}")
+            kernel_exec_result.metadata["error_during_performance"] = e
+
+    # To get base PyTorch time (eager, various compile modes)
+    # please use timing.measure_ref_program_time()   
+
+
+    ###############################################################
+    # [Experimental] to be modularized
+    # Condition: custom kernel ModelNew is correct and we are able to time it correctly with kernel_exec_result
+    # We are working on preventing excessive speedup issues
+    ##############################################################
+
+    if measure_performance and check_for_excessive_speedup:  # experimental: hence able to shut off codepath if needed
+    
+        if verbose:
+            print("[Eval] Additional checks to flag excessive speedup")
+
+        torch.cuda.synchronize(device=device)
+        set_seed(seed_num)
+        inputs = get_inputs()
+        # Convert inputs for performance measurement
+        inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+        
+        model_new = custom_model.to(device=device, dtype=precision)
+        torch.cuda.synchronize(device=device)
+
+        # time PyTorch reference function
+        # same timing_fn as specified from before
+        timing_fn = timing.get_timing_function(timing_method)
+        reference_elapsed_times = timing_fn(
+            original_model,
+            inputs, # ideally cloned for extra safety but handled already in correctness check
+            num_trials=num_perf_trials,
+            verbose=verbose,
+            device=device,
+        )
+        reference_runtime_stats = timing.get_timing_stats(reference_elapsed_times, device=device)
+        kernel_exec_result.ref_runtime = reference_runtime_stats["mean"]
+        kernel_exec_result.ref_runtime_stats = reference_runtime_stats
+
+        # Compute Effective Speedup
+        effective_speedup = kernel_exec_result.ref_runtime / kernel_exec_result.runtime
+
+        # TODO: integrate SoL estimation for each unique program on designated hardware
+        # for now, we will use a heuristics such as 5-10x which is very hard to achieve
+
+        if verbose:
+            print(f"[Eval] Effective Speedup is {effective_speedup:.2f}x using timing method {timing_method}")
+
+        if effective_speedup > excessive_speedup_threshold:
+            kernel_exec_result.metadata["excessive_speedup"] = True
+            
+            print(f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected")
+            print(f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking.")
+
+
+    graceful_eval_cleanup(context, device, tempfile)
+    return kernel_exec_result
+
+
+def register_and_format_exception(
+    exception_type: str,
+    exception_msg: Exception | str,
+    metadata: dict,
+    verbose: bool = False,
+    truncate=False,
+    max_length=200,
+):
+    """
+    max_length characters
+
+    NOTE: I can't get torch truncate to work during exception handling so I have this for now
+    """
+    # Truncate exception message if too long
+    exception_str = str(exception_msg)
+    if truncate and len(exception_str) > max_length:
+        exception_str = exception_str[: max_length - 3] + "..."
+
+    if verbose:
+        print(f"[Exception {exception_type}] {exception_str} ")
+    metadata[exception_type] = exception_str
+
+    return metadata
+
+
+def run_and_check_correctness(
+    original_model_instance: nn.Module,
+    new_model_instance: nn.Module,
+    get_inputs_fn: callable,
+    metadata: dict,
+    num_correct_trials: int,
+    verbose: bool =False,
+    seed: int =42,
+    device: Optional[torch.device] =None,
+    backend: str ="cuda",
+    precision: torch.dtype =torch.float32,
+) -> KernelExecResult:
+    """
+    run the model and check correctness,
+    assume model already loaded and compiled (loaded and compiled in the caller)
+    this is all on GPU, requiring cuda device and transfer .cuda()
+
+    num_correct_trials: run the evalutation multiple times with (ideally) different random inputs to ensure correctness
+    backend: backend type for handling dtype conversions
+    precision: torch.dtype
+    """
+    pass_count = 0
+
+    # Generate num_correct_trials seeds deterministically from the initial seed
+    torch.manual_seed(seed)
+    correctness_trial_seeds = [
+        torch.randint(0, 2**32 - 1, (1,)).item() for _ in range(num_correct_trials)
+    ]
+
+    with torch.no_grad():
+
+        for trial in range(num_correct_trials):
+
+            trial_seed = correctness_trial_seeds[trial]
+            if verbose:
+                print(f"[Eval] Generating Random Input with seed {trial_seed}")
+
+            set_seed(trial_seed)
+            inputs = get_inputs_fn()
+            # Convert inputs to appropriate dtypes for GPU computation
+            inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+
+            set_seed(trial_seed)
+    
+            model = original_model_instance.to(device=device, dtype=precision)
+
+            set_seed(trial_seed)
+     
+            model_new = new_model_instance.to(device=device, dtype=precision)
+
+            output = model(*inputs)
+            torch.cuda.synchronize(device=device)
+            # ensure all GPU operations are completed before checking results
+
+            try:
+                output_new = model_new(*inputs)
+                torch.cuda.synchronize(device=device)
+                if output.shape != output_new.shape:
+                    metadata = register_and_format_exception(
+                        "correctness_issue",
+                        f"Output shape mismatch: Expected {output.shape}, got {output_new.shape}",
+                        metadata,
+                    )
+                    metadata["correctness_issue_name"] = "correctness_issue"
+                    if verbose:
+                        print(
+                            f"[FAIL] trial {trial}: Output shape mismatch: Expected {output.shape}, got {output_new.shape}"
+                        )
+                    return KernelExecResult(
+                        compiled=True, correctness=False, metadata=metadata
+                    )
+
+                # in torchbench, they use both precisions for atol and rtol
+                # kernelbench v0 and v0.1 uses fp32, atol = rtol = 1e-02
+                # now we will return the tolerance from get_tolerance_for_precision
+                tolerance = get_tolerance_for_precision(precision)
+                # check output value difference
+                if not torch.allclose(
+                    output, output_new, atol=tolerance, rtol=tolerance
+                ):  # fail
+                    max_diff = torch.max(torch.abs(output - output_new)).item()
+                    avg_diff = torch.mean(torch.abs(output - output_new)).item()
+                    metadata.setdefault("max_difference", []).append(f"{max_diff:.6f}")
+                    metadata.setdefault("avg_difference", []).append(f"{avg_diff:.6f}")
+                    metadata["correctness_issue"] = "Output mismatch"
+                    if verbose:
+                        print(f"[FAIL] trial {trial}: Output mismatch")
+                else:  # pass
+                    pass_count += 1
+                    if verbose:
+                        print(f"[PASS] trial {trial}: New Model matches Model")
+
+            except Exception as e:
+                print("[Error] Exception happens during correctness check")
+                print(f"Error in launching kernel for ModelNew: {e}")
+                print("\n[Full Traceback]:")
+                traceback.print_exc()
+                print("\n")
+
+                metadata = register_and_format_exception(
+                    "runtime_error", e, metadata, truncate=True
+                )
+                metadata["runtime_error_name"] = get_error_name(e)
+                # Also store the full traceback in metadata for debugging
+                metadata["runtime_error_traceback"] = traceback.format_exc()
+                return KernelExecResult(
+                    compiled=True, correctness=False, metadata=metadata
+                )
+                # break
+
+    if verbose:
+        print(
+            f"[Eval] Pass count: {pass_count}, num_correct_trials: {num_correct_trials}"
+        )
+
+    # put all the useful info here!
+    metadata["correctness_trials"] = f"({pass_count} / {num_correct_trials})"
+
+    if pass_count == num_correct_trials:
+        return KernelExecResult(compiled=True, correctness=True, metadata=metadata)
+    else:
+        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+
+
+def check_metadata_serializable(metadata: dict):
+    """
+    Ensure metadata is JSON serializable,
+    if not, convert non-serializable values to strings
+    """
+    try:
+        json.dumps(metadata)
+    except (TypeError, OverflowError) as e:
+        print(f"[WARNING] Metadata is not JSON serializable, error: {str(e)}")
+        # Convert non-serializable values to strings
+        metadata = {
+            "eval_0": {
+                k: (
+                    str(v)
+                    if not isinstance(
+                        v, (dict, list, str, int, float, bool, type(None))
+                    )
+                    else v
+                )
+                for k, v in metadata["eval_0"].items()
+            }
+        }
+        print(
+            f"[WARNING] Metadata now converted to string: {metadata} to be JSON serializable"
+        )
+
+    return metadata
+
+
+def check_metadata_serializable_all_types(metadata: dict):
+    """
+    Ensure metadata is JSON serializable,
+    if not, convert non-serializable values to strings recursively
+    """
+
+    def convert_to_serializable(obj):
+        if isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_serializable(v) for v in obj]
+        elif isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+        else:
+            return str(obj)
+
+    try:
+        json.dumps(metadata)
+        return metadata
+    except (TypeError, OverflowError) as e:
+        print(f"[WARNING] Metadata is not JSON serializable, error: {str(e)}")
+        # Convert non-serializable values to strings recursively
+        converted_metadata = convert_to_serializable(metadata)
+        print(
+            f"[WARNING] Metadata now converted to be JSON serializable: {converted_metadata}"
+        )
+        return converted_metadata
+
+
+# if __name__ == "__main__":
+# fetch_kernel_from_database("kernelbench_prompt_v2_level_2", 1, 1, "http://localhost:9091")
+# print(fetch_ref_arch_from_level_problem_id("2", 1, with_name=True))
+# Note: fetch_baseline_time is available in kernelbench.timing module[?2004hroot@modal:/# grep -n "backend\|torch.compile\|cuda_event\|def eval_kernel_against_ref\|ref_runtime\|time_execution" /usr/local/lib/python3.10/dist-packages/kernelbench/eval.py | head -50
+[?2004l120:    ref_runtime: float = -1.0  # in us, only recorded if we decide to measure performance
+121:    ref_runtime_stats: dict = {} # only recorded if we decide to measure performance
+370:def _process_input_tensor(input, device, backend="cuda", precision=torch.float32):
+372:    Helper function to move tensors to the correct device and apply backend-specific dtype casting.
+377:        backend: Backend type (e.g., 'cuda', 'triton', 'cute')
+390:    # Default for all other backends and float types
+394:def eval_kernel_against_ref(
+401:    timing_method: str = "cuda_event", # see timing.py
+407:    backend: str = "cuda",  # can be 'cuda', 'triton', 'tilelang', or 'cute'
+423:    backend: str, one of 'cuda', 'triton', 'tilelang', or 'cute'
+435:    backend_lower = backend.lower()
+437:    if backend_lower == "hip" and vendor != "amd":
+438:        raise ValueError(f"HIP backend requires AMD GPU, got {vendor}")
+440:    if backend_lower in ["cuda", "cute", "thunderkittens"] and vendor == "amd":
+441:        raise ValueError(f"{backend} backend requires NVIDIA GPU, got AMD")
+443:    if backend_lower == "tilelang":
+458:    uses_tempfile = backend.lower() in ["triton", "tilelang", "cute"]
+495:    init_inputs = [_process_input_tensor(x, device, backend, precision) for x in init_inputs]
+513:        backend_lower = backend.lower()
+514:        if backend_lower in ["triton", "tilelang", "cute"]:
+521:            # Default CUDA backend
+596:            backend=backend,
+618:                inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+623:                # support multiple timing backend
+663:        inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+679:        kernel_exec_result.ref_runtime = reference_runtime_stats["mean"]
+680:        kernel_exec_result.ref_runtime_stats = reference_runtime_stats
+683:        effective_speedup = kernel_exec_result.ref_runtime / kernel_exec_result.runtime
+736:    backend: str ="cuda",
+745:    backend: backend type for handling dtype conversions
+767:            inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+[?2004hroot@modal:/# sed -n '440,700p' /usr/local/lib/python3.10/dist-packages/kernelbench/eval.py
+[?2004l    if backend_lower in ["cuda", "cute", "thunderkittens"] and vendor == "amd":
+        raise ValueError(f"{backend} backend requires NVIDIA GPU, got AMD")
+    
+    if backend_lower == "tilelang":
+        assert precision == torch.float16 or precision == torch.bfloat16, "TileLang only supports fp16 or bfloat16"
+    
+    torch.set_printoptions(
+        precision=4,  # Decimal places
+        threshold=10,  # Total number of elements before truncating
+        edgeitems=3,  # Number of elements at beginning and end of dimensions
+        linewidth=80,  # Maximum width before wrapping
+    )
+
+    # set CUDA device
+    torch.cuda.set_device(device)
+    
+    # Backends that use tempfile approach and need CUDA_VISIBLE_DEVICES
+    # TileLang, Triton, and CuTe all use tempfile for proper module loading
+    uses_tempfile = backend.lower() in ["triton", "tilelang", "cute"]
+    
+    metadata = {}  # for storing result metadata
+    metadata["hardware"] = torch.cuda.get_device_name(device=device)
+    metadata["device"] = str(device)  # for debugging
+
+    if uses_tempfile:
+        # need to set env var for triton/cute code to guarantee no wrong device shenanigans
+        if isinstance(device, int):
+            device_num = device
+        elif isinstance(device, torch.device):
+            assert (
+                device.type == "cuda"
+            ), "CUDA is not availible on device, cannot run Eval"
+            device_num = device.index
+        else:
+            raise ValueError(
+                f"device must be an int or torch.device, got {type(device)}"
+            )
+        # NVIDIA uses CUDA_VISIBLE_DEVICES, AMD uses HIP_VISIBLE_DEVICES
+        if vendor == "amd":
+            os.environ["HIP_VISIBLE_DEVICES"] = str(device_num)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(device_num)
+    context = {}
+
+    if verbose:
+        print(f"[Eval] Start Evalulation! on device: {device}")
+        print("[Eval] Loading Original Model")
+
+    Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
+        original_model_src, context
+    )
+    set_seed(seed_num)  # set seed for reproducible input
+    init_inputs = get_init_inputs()
+    
+    # Convert inputs to appropriate dtypes for GPU computation
+    init_inputs = [_process_input_tensor(x, device, backend, precision) for x in init_inputs]
+    
+    with torch.no_grad():
+        set_seed(seed_num)  # set seed for reproducible weights
+        original_model = Model(*init_inputs)
+        assert hasattr(original_model, "forward")
+        if verbose:
+            print("[Eval] Original Model Loaded")
+    
+    if verbose:
+        print("[Eval] Loading and Compiling New Model with Custom CUDA Kernel")
+
+    # this is where compilation happens
+    try:
+        os.environ["TORCH_USE_CUDA_DSA"] = "1"  # compile with device side assertion
+        tempfile = None
+        # add hash for later to distinguish between multi-turn kernels
+        
+        backend_lower = backend.lower()
+        if backend_lower in ["triton", "tilelang", "cute"]:
+            # Use tempfile approach for triton, tilelang, and cute
+            # These DSLs require proper module import for JIT decorators to work
+            ModelNew, tempfile = load_custom_model_with_tempfile(
+                custom_model_src, entry_point="ModelNew"
+            )
+        else:
+            # Default CUDA backend
+            ModelNew = load_custom_model(custom_model_src, context, build_dir)
+        torch.cuda.synchronize(device=device)  # not sure if this is too much
+    except Exception as e:
+        print(
+            f"Failed to compile custom CUDA kernel: Record as compilation failure. \nError: {e}"
+        )
+        # TODO: add metadata for compilation error (how to we get the compilation error message?)
+
+        if "lock" in str(e) or "No such file or directory" in str(e):
+            # this is a lock file error, likely due to concurrent compilation
+            # this does not necessarily mean the compilation failed, but we should retry
+            print(
+                f"[Eval] Lock file error during compilation, Please retry. Error: {e}"
+            )
+            graceful_eval_cleanup(context, device, tempfile)
+            return None
+        else:
+            metadata["compilation_error_name"] = get_error_name(e)
+            metadata["compilation_error"] = e
+            graceful_eval_cleanup(context, device, tempfile)
+            return KernelExecResult(
+                compiled=False, metadata=metadata
+            )  # skip further steps
+
+    # Check if ModelNew was successfully loaded (load_custom_model returns None on syntax errors)
+    if ModelNew is None:
+        print(
+            "Failed to load custom model: Syntax error or ModelNew not found in generated code. Record as compilation failure."
+        )
+        metadata["compilation_error_name"] = "SyntaxError"
+        metadata["compilation_error"] = "Syntax error in custom generated code or ModelNew not found"
+        graceful_eval_cleanup(context, device, tempfile)
+        return KernelExecResult(
+            compiled=False, metadata=metadata
+        )  # skip further steps
+
+    # at this point we passed compilation
+    try:
+        with torch.no_grad():
+            set_seed(seed_num)  # set seed for reproducible weights
+            custom_model = ModelNew(*init_inputs)
+            assert hasattr(custom_model, "forward")
+            original_model = original_model.to(device=device, dtype=precision)
+            custom_model = custom_model.to(device=device, dtype=precision)
+            torch.cuda.synchronize(device=device)
+        if verbose:
+            print("[Eval] New Model with Custom CUDA Kernel Loaded")
+    except RuntimeError as e:
+        print(
+            f"Failed to load custom CUDA kernel; Compiled but not able to run, count as runtime error. \nError: {e}"
+        )
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        graceful_eval_cleanup(context, device, tempfile)
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        return KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )  # skip further steps
+
+    kernel_exec_result = None
+
+    # Check Correctness
+    if verbose:
+        print("[Eval] Checking Correctness")
+    try:
+        kernel_exec_result = run_and_check_correctness(
+            original_model,
+            custom_model,
+            get_inputs,
+            metadata=metadata,
+            num_correct_trials=num_correct_trials,
+            verbose=verbose,
+            seed=seed_num,
+            device=device,
+            backend=backend,
+            precision=precision,
+        )
+    except Exception as e:
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        kernel_exec_result = KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )
+
+    # Measure Performance [Optional] | conditioned on compilation + correctness + no exception so far
+    if measure_performance:
+        try:
+            if kernel_exec_result and kernel_exec_result.correctness:
+                if verbose:
+                    print("[Eval] Measuring Performance as Sample is Correct")
+
+                torch.cuda.synchronize(device=device)
+                set_seed(seed_num)
+                inputs = get_inputs()
+                # Convert inputs for performance measurement
+                inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+                
+                model_new = custom_model.to(device=device, dtype=precision)
+                torch.cuda.synchronize(device=device)
+
+                # support multiple timing backend
+                timing_fn = timing.get_timing_function(timing_method)
+                elapsed_times = timing_fn(
+                    model_new,
+                    inputs,
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                    device=device,
+                )
+                runtime_stats = timing.get_timing_stats(elapsed_times, device=device)
+
+                if verbose:
+                    print(f"[Eval] Performance Stats: {runtime_stats}")
+                kernel_exec_result.runtime = runtime_stats["mean"]
+                kernel_exec_result.runtime_stats = runtime_stats
+
+        except Exception as e:
+            if verbose:
+                print(f"[Eval] Error in Measuring Performance: {e}")
+            kernel_exec_result.metadata["error_during_performance"] = e
+
+    # To get base PyTorch time (eager, various compile modes)
+    # please use timing.measure_ref_program_time()   
+
+
+    ###############################################################
+    # [Experimental] to be modularized
+    # Condition: custom kernel ModelNew is correct and we are able to time it correctly with kernel_exec_result
+    # We are working on preventing excessive speedup issues
+    ##############################################################
+
+    if measure_performance and check_for_excessive_speedup:  # experimental: hence able to shut off codepath if needed
+    
+        if verbose:
+            print("[Eval] Additional checks to flag excessive speedup")
+
+        torch.cuda.synchronize(device=device)
+        set_seed(seed_num)
+        inputs = get_inputs()
+        # Convert inputs for performance measurement
+        inputs = [_process_input_tensor(x, device, backend, precision) for x in inputs]
+        
+        model_new = custom_model.to(device=device, dtype=precision)
+        torch.cuda.synchronize(device=device)
+
+        # time PyTorch reference function
+        # same timing_fn as specified from before
+        timing_fn = timing.get_timing_function(timing_method)
+        reference_elapsed_times = timing_fn(
+            original_model,
+            inputs, # ideally cloned for extra safety but handled already in correctness check
+            num_trials=num_perf_trials,
+            verbose=verbose,
+            device=device,
+        )
+        reference_runtime_stats = timing.get_timing_stats(reference_elapsed_times, device=device)
+        kernel_exec_result.ref_runtime = reference_runtime_stats["mean"]
+        kernel_exec_result.ref_runtime_stats = reference_runtime_stats
+
+        # Compute Effective Speedup
+        effective_speedup = kernel_exec_result.ref_runtime / kernel_exec_result.runtime
+
+        # TODO: integrate SoL estimation for each unique program on designated hardware
+        # for now, we will use a heuristics such as 5-10x which is very hard to achieve
+
+        if verbose:
+            print(f"[Eval] Effective Speedup is {effective_speedup:.2f}x using timing method {timing_method}")
+
+        if effective_speedup > excessive_speedup_threshold:
+            kernel_exec_result.metadata["excessive_speedup"] = True
+            
+            print(f"[WARNING] Excessive speedup {effective_speedup:.2f}x over {excessive_speedup_threshold}x threshold detected")
+            print(f"[WARNING] Double check your kernel carefully to ensure it is not reward hacking.")
+
+
+    graceful_eval_cleanup(context, device, tempfile)
+    return kernel_exec_result
+
+[?2004hroot@modal:/# sed -n '1,120p' /usr/local/lib/python3.10/dist-packages/kernelbench/timing.py
+[?2004limport torch
+import json
+import numpy as np
+import time
+from typing import Any, Optional, Union
+import os
+
+
+def measure_ref_program_time(
+    ref_arch_name: str,
+    ref_arch_src: str, # PyTorch program code string
+    num_warmup: int = 5,
+    num_trials: int = 100,
+    discard_first: int = 1,
+    timing_method: str = "cuda_event",
+    # Torch eager or torch.compile configuration
+    use_torch_compile: bool = False,
+    torch_compile_backend: str = "inductor",
+    torch_compile_options: str = "default",
+    device: torch.device = torch.device("cuda:0"),
+    verbose: bool = False,
+    precision: Union[str, torch.dtype] = "fp32", # fp16, fp32, bf16 or torch.dtype
+) -> dict:
+    """Measure the runtime of a KernelBench *reference* program.
+
+    This measures the execution time of the reference `Model` defined in
+    `ref_arch_src` (i.e., *not* `ModelNew`). It can optionally run the reference
+    model under `torch.compile`.
+
+    NOTE: This function is for PyTorch-only reference models, so no `backend` parameter is needed.
+    For pure PyTorch program, we assume it operates all on main stream (as torch operators execute on the default cuda stream).
+    Standard PyTorch ops do NOT spawn extra streams.
+    """
+    from kernelbench.eval import load_original_model_and_inputs, set_seed
+
+    context = {}
+    Model, get_init_inputs, get_inputs = load_original_model_and_inputs(
+        ref_arch_src, context
+    )
+
+    try:
+        with torch.no_grad():
+            if isinstance(device, str):
+                device = torch.device(device)
+            elif isinstance(device, int):
+                device = torch.device(f"cuda:{device}")
+            torch.cuda.set_device(device)
+
+            torch.cuda.synchronize(device=device)
+            set_seed(42)
+            inputs = get_inputs()
+            set_seed(42)
+            init_inputs = get_init_inputs()
+
+            from kernelbench.eval import get_torch_dtype_from_string
+            if isinstance(precision, str):
+                precision_dtype = get_torch_dtype_from_string(precision)
+            else:
+                precision_dtype = precision
+
+
+            # set model weights and inputs to specified precision
+            inputs = [
+                x.to(device=device, dtype=precision_dtype) if isinstance(x, torch.Tensor) else x
+                for x in inputs
+            ]
+            init_inputs = [
+                x.to(device=device, dtype=precision_dtype) if isinstance(x, torch.Tensor) else x
+                for x in init_inputs
+            ]
+
+            model = Model(*init_inputs)
+            model = model.to(device=device, dtype=precision_dtype)
+
+            # convert all precision so torch compile can target specific dtype
+            if use_torch_compile:
+                torch._dynamo.reset() # reset torch dynamo cache (clear memory and reset graph)
+                print(
+                    f"Using torch.compile to compile model {ref_arch_name} with {torch_compile_backend} backend and {torch_compile_options} mode"
+                )
+                # NOTE: torch compile uses lazy compilation (triggered by first forward pass)
+                # the warmup in the timing function handles that and should not affect timed trials
+                model = torch.compile(
+                    model,
+                    backend=torch_compile_backend,
+                    mode=torch_compile_options,
+                )
+            else:
+                print(f"Using PyTorch Eager Execution on {ref_arch_name}")
+
+            torch.cuda.synchronize(device=device)
+
+            timing_fn = get_timing_function(timing_method)
+            elapsed_times = timing_fn(
+                model,
+                inputs,
+                num_warmup=num_warmup,
+                num_trials=num_trials,
+                discard_first=discard_first,
+                verbose=verbose,
+                device=device,
+            )
+            runtime_stats = get_timing_stats(elapsed_times, device=device)
+
+            if verbose:
+                print(f"{ref_arch_name} {runtime_stats}")
+
+            return runtime_stats
+    except Exception as e:
+        print(f"[Eval] Error in Measuring Performance: {e}")
+        return None
+
+
+def measure_program_time(*args, **kwargs):
+    """Alias for backwards compatibility. See `measure_ref_program_time`."""
+    return measure_ref_program_time(*args, **kwargs)
+
+################################################################################
+# timing.py
+# Various timing methods and utilities for performance evaluation
+[?2004hroot@modal:/# sed -n '550,610p' /usr/local/lib/python3.10/dist-packages/kernelbench/eval.py
+[?2004l        )
+        metadata["compilation_error_name"] = "SyntaxError"
+        metadata["compilation_error"] = "Syntax error in custom generated code or ModelNew not found"
+        graceful_eval_cleanup(context, device, tempfile)
+        return KernelExecResult(
+            compiled=False, metadata=metadata
+        )  # skip further steps
+
+    # at this point we passed compilation
+    try:
+        with torch.no_grad():
+            set_seed(seed_num)  # set seed for reproducible weights
+            custom_model = ModelNew(*init_inputs)
+            assert hasattr(custom_model, "forward")
+            original_model = original_model.to(device=device, dtype=precision)
+            custom_model = custom_model.to(device=device, dtype=precision)
+            torch.cuda.synchronize(device=device)
+        if verbose:
+            print("[Eval] New Model with Custom CUDA Kernel Loaded")
+    except RuntimeError as e:
+        print(
+            f"Failed to load custom CUDA kernel; Compiled but not able to run, count as runtime error. \nError: {e}"
+        )
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        graceful_eval_cleanup(context, device, tempfile)
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        return KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )  # skip further steps
+
+    kernel_exec_result = None
+
+    # Check Correctness
+    if verbose:
+        print("[Eval] Checking Correctness")
+    try:
+        kernel_exec_result = run_and_check_correctness(
+            original_model,
+            custom_model,
+            get_inputs,
+            metadata=metadata,
+            num_correct_trials=num_correct_trials,
+            verbose=verbose,
+            seed=seed_num,
+            device=device,
+            backend=backend,
+            precision=precision,
+        )
+    except Exception as e:
+        # TODO: add metadata for runtime error e.g. error in launching kernel, illegal memory access, ...
+        metadata["runtime_error"] = e
+        metadata["runtime_error_name"] = get_error_name(e)
+        kernel_exec_result = KernelExecResult(
+            compiled=True, correctness=False, metadata=metadata
+        )
+
+    # Measure Performance [Optional] | conditioned on compilation + correctness + no exception so far
+    if measure_performance:
+        try:
+            if kernel_exec_result and kernel_exec_result.correctness:
+[?2004hroot@modal:/# sed -n '120,260p' /usr/local/lib/python3.10/dist-packages/kernelbench/timing.py
+[?2004l# Various timing methods and utilities for performance evaluation
+# please make a PR if you have suggestions!
+
+# Try them out at src/unit_tests/test_eval_timing.py
+################################################################################
+
+def clear_l2_cache(device: torch.device | str = "cuda"):
+    """
+    Clear L2 Cache line by thrashing with a large tensor
+    Acknowledge GPU mode reference kernel repo:
+    https://github.com/gpu-mode/reference-kernels/commit/7c15075a39286e88939d99d3f3a60be88b8e6223#diff-3a30a71cbf8db2badd224f4d92f9a2546925a5b522632a31d353526b7a5f3338R158-R163
+    """
+    # don't reserve space for persisting lines
+    # cp.cuda.runtime.cudaDeviceSetLimit(cp.cuda.runtime.cudaLimitPersistingL2CacheSize, 0)
+    
+    # Thrash L2 cache by creating a larger dummy tensor, effectively flushing the cache
+    # 32 * 1024 * 1024 * 8B = 256MB 
+    # NOTE: we can make this more adaptive based on device
+    # L2 cache sizes: A100=40MB, H100=50MB, H200=90MB, RTX4090=72MB, L40S=48MB, Blackwell≈192MB → overwrite >200MB to fully thrash L2
+    dummy = torch.empty((32, 1024, 1024), dtype=torch.int64, device=device)
+    # write to tensor with inplace fill
+    dummy.fill_(42) 
+    del dummy
+
+def clear_l2_cache_triton(cache=None, device: str = "cuda"):
+    """
+    Thrash the cache by making a large dummy tensor, using triton runtime's functionality
+    """
+    from triton import runtime as triton_runtime
+    with torch.cuda.device(device):
+        cache = triton_runtime.driver.active.get_empty_cache_for_benchmark()
+        # this effectively thrashes L2 cache under the hood too
+        triton_runtime.driver.active.clear_cache(cache)
+
+
+def get_timing_function(
+    method: str = "cuda_event", # by default 
+) -> callable:
+    """
+    Get timing function by method name.
+
+    Available methods:
+        - "cuda_event": torch.cuda.event timing (default, explicit trial control)
+        - "do_bench": Use triton's do_bench (adaptive trial count based on time budget)
+        - "do_bench_impl": Mirrors Triton's do_bench implementation (explicit control)
+        - "host_time": Host side wall-clock timing (might include overhead)
+    
+    Args:
+        method: Name of timing method to use
+    
+    Returns:
+        Timing function with signature (kernel_fn, args, num_warmup, num_trials, 
+        discard_first, verbose, device) -> list[float]
+    """
+    print(
+        f"[Profiling] Using timing method: {method}"
+    )
+    # NOTE: here are all the timing methods we supporting for now
+    match method:
+        case "cuda_event":
+            return time_execution_with_cuda_event
+        case "do_bench":
+            # caveat: just using do_bench as it is 
+            # do not have precise control over number of trials
+            return time_execution_with_do_bench_interface
+        case "do_bench_impl":
+            # do_bench equivalent implementations for transparency and control
+            return time_execution_with_do_bench_impl
+        case "host_time":
+            return time_execution_with_host_time 
+        case "nsight_python_time":
+            return time_execution_with_nsight_python
+        # we might add other methods in the future
+        case _: 
+            raise ValueError(f"Unsupported timing method: {method}")
+
+"""
+Kernel Timing Functions
+NOTE: we have a WIP blogpost on this topic covering the various timing approaches   
+"""
+
+def time_execution_with_cuda_event(
+    kernel_fn: callable,
+    args: list[Any],
+    num_warmup: int = 3,
+    num_trials: int = 10,
+    discard_first: int = 1, # set to 0 to disable
+    verbose: bool = True,
+    device: torch.device = None,
+) -> list[float]:
+    """
+    Time a CUDA kernel function over multiple trials using torch.cuda.event
+    The first version of KernelBench used this for evaluation.
+    We care about cold cache performance here.
+
+    Note: this version does not guard against adverserial cuda streams yet.
+    It assumes computation is done on the current stream for current device. 
+    Stay tuned for future PRs. 
+
+    Args:
+        kernel_fn: Function to time
+        args: Arguments to pass to kernel_fn
+        num_warmup: Number of warmup iterations before timing
+        num_trials: Number of timing trials to run
+        discard_first: Number of first trials to discard, for consistency with host_time, set to 0 to disable
+        verbose: Whether to print per-trial timing info
+        device: CUDA device to use, defaults to current device
+
+    Returns:
+        List of elapsed times in milliseconds (length = num_trials)
+    """
+    if device is None:
+        if verbose:
+            print(f"Using current device: {torch.cuda.current_device()}")
+        device = torch.cuda.current_device()
+
+    with torch.cuda.device(device):
+        
+        # Warm ups
+        for _ in range(num_warmup):
+            kernel_fn(*args)
+            torch.cuda.synchronize(device=device)
+        
+        # note this only release PyTorch’s CUDA caching allocator, not necessarily clearing device's L2 cache
+        torch.cuda.empty_cache()
+        
+        print(f"[Profiling] Using device: {device} {torch.cuda.get_device_name(device)}, warm up {num_warmup}, trials {num_trials}"
+        )
+
+        elapsed_times: list[float] = [] # in ms
+
+        # Timing trials
+        for trial in range(num_trials + discard_first):
+            torch.cuda.synchronize(device=device) # block on all streams
+
+            # create event marker default is not interprocess
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            clear_l2_cache(device=device) # measuring cold cache performance
+
+[?2004hroot@modal:/# sed -n '370,393p' /usr/local/lib/python3.10/dist-packages/kernelbench/eval.py
+[?2004ldef _process_input_tensor(input, device, backend="cuda", precision=torch.float32):
+    """
+    Helper function to move tensors to the correct device and apply backend-specific dtype casting.
+    
+    Args:
+        input: Input tensor or non-tensor value
+        device: Target CUDA device
+        backend: Backend type (e.g., 'cuda', 'triton', 'cute')
+        precision: torch.dtype 
+    Returns:
+        Processed tensor on correct device with correct dtype, or original value if not a tensor
+    """
+
+    # sometimes things like init inputs are floats (like in the case of labels / targets, classification losses, etc.) 
+    if not isinstance(input, torch.Tensor):
+        return input
+    
+    # cast to the desired percision dtype for activations
+    input_tensor = input.to(dtype=precision)
+    
+    # Default for all other backends and float types
+    return input_tensor.to(device=device)
+
+
+[?2004hroot@modal:/# gpu run -- python3 -c "import torch, triton; print(torch.__version__, triton.__version__); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0))"
+[?2004lrequest ID: 07bbace1b8ed4a8b8053f76d29773581
+box: sb-Mgd8CNtDjGLlV5gPaum591
+command: a7c0b954343b495f88a12d11570fb6c1
+2.9.0+cu128 3.5.0
+NVIDIA H100 80GB HBM3
+(9, 0)
+[?2004hroot@modal:/# cat > /workspace/solution.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import triton
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l
+[?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_bias_kernel(
+[?2004l[?2004h>     a_ptr, b_ptr, bias_ptr, c_ptr,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     sam, sak, sbk, sbn, scm, scn,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr, EVEN_K: tl.constexpr, IP: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h> 
+[?2004l_[?2004h>     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+[?2004l[?2004h>     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     rk = tl.arange(0, BLOCK_K)
+[?2004l[?2004h> 
+[?2004l [?2004h>     a_ptrs = a_ptr + rm[:, None] * sam + rk[None, :] * sak
+[?2004l[?2004h>     b_ptrs = b_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h> 
+[?2004li[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         if EVEN_K:
+[?2004l[?2004h>             a = tl.load(a_ptrs)
+[?2004l[?2004h>             b = tl.load(b_ptrs)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             k_rem = K - k * BLOCK_K
+[?2004l[?2004h>             a = tl.load(a_ptrs, mask=rk[None, :] < k_rem, other=0.0)
+[?2004l[?2004h>             b = tl.load(b_ptrs, mask=rk[:, None] < k_rem, other=0.0)
+[?2004l[?2004h>         acc = tl.dot(a, b, acc, input_precision=IP)
+[?2004l[?2004h>         a_ptrs += BLOCK_K * sak
+[?2004l[?2004h>         b_ptrs += BLOCK_K * sbk
+[?2004l[?2004h> 
+[?2004l
+[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h> 
+[?2004ll[?2004h>     c_ptrs = c_ptr + rm[:, None] * scm + rn[None, :] * scn
+[?2004l[?2004h>     mask = (rm[:, None] < M) & (rn[None, :] < N)
+[?2004l[?2004h>     tl.store(c_ptrs, acc, mask=mask)
+[?2004l[?2004h> 
+[?2004lt[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_bias_tf32x3_kernel(
+[?2004l[?2004h>     a_ptr, bhi_ptr, blo_ptr, bias_ptr, c_ptr,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     sam, sak, sbk, sbn, scm, scn,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr, IP: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     # C = A @ Bhi - A @ Blo + bias, with tf32 dots (3xTF32 emulation of fp32)
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h> 
+[?2004l[?2004h>     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+[?2004l[?2004h>     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     rk = tl.arange(0, BLOCK_K)
+[?2004l[?2004h> 
+[?2004l.[?2004h>     a_ptrs = a_ptr + rm[:, None] * sam + rk[None, :] * sak
+[?2004l[?2004h>     bhi_ptrs = bhi_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h>     blo_ptrs = blo_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h> 
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         a = tl.load(a_ptrs)
+[?2004l[?2004h>         bhi = tl.load(bhi_ptrs)
+[?2004l[?2004h>         blo = tl.load(blo_ptrs)
+[?2004l[?2004h>         a_hi = a.to(tl.float32)  # a is fp32; convert done by triton in dot
+[?2004l[?2004h>         acc = tl.dot(a, bhi, acc, input_precision=IP)
+[?2004l[?2004h>         acc = tl.dot(a, blo, acc, input_precision=IP)  # blo is negative lo
+[?2004l[?2004h>         a_ptrs += BLOCK_K * sak
+[?2004l[?2004h>         bhi_ptrs += BLOCK_K * sbk
+[?2004l[?2004h>         blo_ptrs += BLOCK_K * sbk
+[?2004l[?2004h> 
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h> 
+[?2004l[?2004h>     c_ptrs = c_ptr + rm[:, None] * scm + rn[None, :] * scn
+[?2004l[?2004h>     mask = (rm[:, None] < M) & (rn[:, None] < N)
+[?2004l[?2004h>     tl.store(c_ptrs, acc, mask=mask)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> _TF32X3_CONFIGS = [
+[?2004l[?2004h>     (128, 128, 32, 8, 8, 3),
+[?2004l[?2004h>     (128, 256, 32, 8, 8, 3),
+[?2004l[?2004h>     (256, 128, 32, 8, 8, 3),
+[?2004l[?2004h>     (128, 128, 64, 8, 8, 3),
+[?2004l[?2004h>     (128, 256, 64, 8, 8, 4),
+[?2004l[?2004h>     (256, 128, 64, 8, 8, 4),
+[?2004l[?2004h>     (128, 64, 64, 8, 8, 4),
+[?2004l[?2004h>     (64, 128, 64, 8, 8, 4),
+[?2004l[?2004h> ]
+[?2004l[?2004h> 
+[?2004l[?2004h> _TF32X3_CACHE = {}
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _pick_config(M, N, K, n_dots):
+[?2004l[?2004h>     key = (M, N, K, n_dots)
+[?2004l[?2004h>     if key in _TF32X3_CACHE:
+[?2004l[?2004h>         return _TF32X3_CACHE[key]
+[?2004l[?2004h>     best = None
+[?2004l[?2004h>     best_score = None
+[?2004l[?2004h>     for (bm, bn, bk, gm, nw, ns) in _TF32X3_CONFIGS:
+[?2004l[?2004h>         grid_m = (M + bm - 1) // bm
+[?2004l[?2004h>         grid_n = (N + bn - 1) // bn
+[?2004l[?2004h>         blocks = grid_m * grid_n
+[?2004l[?2004h>         # wave quantization on 78-132 SMs (use 132 for H100)
+[?2004l[?2004h>         sms = 132
+[?2004l[?2004h>         waves = (blocks + sms - 1) // sms
+[?2004l[?2004h>         eff = blocks / (waves * sms)
+[?2004l[?2004h>         score = eff
+[?2004l[?2004h>         if best_score is None or score > best_score:
+[?2004l[?2004h>             best_score = score
+[?2004l[?2004h>             best = (bm, bn, bk, gm, nw, ns)
+[?2004l[?2004h>     _TF32X3_CACHE[key] = best
+[?2004l[?2004h>     return best
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ModelNew(nn.Module):
+[?2004l[?2004h>     def __init__(self, in_features, out_features, scaling_factor):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         lin = nn.Linear(in_features, out_features)
+[?2004l[?2004h>         s = 1.0 + float(scaling_factor)
+[?2004l[?2004h>         with torch.no_grad():
+[?2004l[?2004h>             lin.weight.mul_(s)
+[?2004l[?2004h>             lin.bias.mul_(s)
+[?2004l[?2004h>         self.weight = lin.weight
+[?2004l[?2004h>         self.bias = lin.bias
+[?2004l[?2004h>         # buffers for tf32x3 path (created on first cuda forward)
+[?2004l[?2004h>         self._w_hi = None
+[?2004l[?2004h>         self._w_neg_lo = None
+[?2004l[?2004h>         self._mode = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     def _prep_tf32(self):
+[?2004l[?2004h>         w = self.weight.detach()
+[?2004l[?2004h>         w_hi = w.to(torch.bfloat16).to(torch.float32)
+[?2004l[?2004h>         # split for tf32: hi via tf32 rounding
+[?2004l[?2004h>         w_hi32 = (w.view(torch.int32) & ~0x1FFF).view(torch.float32) if False else w_hi
+[?2004l[?2004h>         self._w_hi = w_hi32.t().contiguous()
+[?2004l[?2004h>         self._w_neg_lo = (w - w_hi32).neg_().t().contiguous() if False else (w - w_hi32).neg().t().contiguous()
+[?2004l[?2004h>         self._mode = "tf32x3"
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         w = self.weight
+[?2004l[?2004h>         if x.is_cuda and x.dtype == torch.float32:
+[?2004l[?2004h>             if self._mode is None:
+[?2004l[?2004h>                 self._prep()
+[?2004l[?2004h>             if self._mode == "tf32x3":
+[?2004l[?2004h>                 M, K = x.shape
+[?2004l[?2004h>                 N = w.shape[0]
+[?2004l[?2004h>                 out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+[?2004l[?2004h>                 bm, bn, bk, gm, nw, ns = _pick_config(M, N, K, 3)
+[?2004l[?2004h>                 grid = lambda meta: ((triton.cdiv(M, meta['BLOCK_M']) * triton.cdiv(N, meta['BLOCK_N'])),)
+[?2004l[?2004h>                 _gemm_bias_tf32x3_kernel[grid](
+[?2004l[?2004h>                     x, self._w_hi, self._w_neg_lo, self.bias, out,
+[?2004l[?2004h>                     M, N, K,
+[?2004l[?2004h>                     x.stride(0), x.stride(1),
+[?2004l[?2004h>                     self._w_hi.stride(0), self._w_hi.stride(1),
+[?2004l[?2004h>                     out.stride(0), out.stride(1),
+[?2004l[?2004h>                     BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm,
+[?2004l[?2004h>                     IP="tf32", num_warps=nw, num_stages=ns,
+[?2004l[?2004h>                 )
+[?2004l[?2004h>                 return out
+[?2004l[?2004h>         return F.linear(x, w, self.bias)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def _prep(self):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             w = self.weight.detach()
+[?2004l[?2004h>             # tf32 split: zero out low 13 mantissa bits for hi part
+[?2004l[?2004h>             w32 = w.contiguous()
+[?2004l[?2004h>             hi = (w32.view(torch.int32) & -8192).view(torch.float32)  # ~0x1FFF mask
+[?2004l[?2004h>             neg_lo = (w32 - hi).neg().contiguous()
+[?2004l[?2004h>             self._w_hi = hi.t().contiguous()
+[?2004l[?2004h>             self._w_neg_lo = neg_lo.t().contiguous()
+[?2004l[?2004h>             self._mode = "tf32x3"
+[?2004l[?2004h>         except Exception:
+[?2004l[?2004h>             self._mode = "fp32"
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# python3 -c "import ast; ast.parse(open('/workspace/solution.py').read())" && echo OK
+[?2004lOK
+[?2004hroot@modal:/# cat > /workspace/solution.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import triton
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_bias_kernel(
+[?2004l[?2004h>     a_ptr, b_ptr, bias_ptr, c_ptr,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     sam, sak, sbk, sbn, scm, scn,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr, IP: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h> 
+[?2004l[?2004h>     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+[?2004l[?2004h>     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     rk = tl.arange(0, BLOCK_K)
+[?2004l[?2004h> 
+[?2004l[?2004h>     a_ptrs = a_ptr + rm[:, None] * sam + rk[None, :] * sak
+[?2004l[?2004h>     b_ptrs = b_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h> 
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         a = tl.load(a_ptrs)
+[?2004l[?2004h>         b = tl.load(b_ptrs)
+[?2004l[?2004h>         acc = tl.dot(a, b, acc, input_precision=IP)
+[?2004l[?2004h>         a_ptrs += BLOCK_K * sak
+[?2004l[?2004h>         b_ptrs += BLOCK_K * sbk
+[?2004l[?2004h> 
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h> 
+[?2004l[?2004h>     c_ptrs = c_ptr + rm[:, None] * scm + rn[None, :] * scn
+[?2004l[?2004h>     mask = (rm[:, None] < M) & (rn[None, :] < N)
+[?2004l[?2004h>     tl.store(c_ptrs, acc, mask=mask)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> # (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_warps, num_stages)
+[?2004l[?2004h> _BEST_CONFIG = (128, 128, 32, 8, 8, 3)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ModelNew(nn.Module):
+[?2004l[?2004h>     def __init__(self, in_features, out_features, scaling_factor):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         lin = nn.Linear(in_features, out_features)
+[?2004l[?2004h>         s = 1.0 + float(scaling_factor)
+[?2004l[?2004h>         with torch.no_grad():
+[?2004l[?2004h>             lin.weight.mul_(s)
+[?2004l[?2004h>             lin.bias.mul_(s)
+[?2004l[?2004h>         self.weight = lin.weight
+[?2004l[?2004h>         self.bias = lin.bias
+[?2004l[?2004h>         self._w_t = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     def _prep(self):
+[?2004l[?2004h>         self._w_t = self.weight.detach().t().contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         if x.is_cuda and x.dtype == torch.float32 and x.dim() == 2:
+[?2004l[?2004h>             if self._w_t is None or self._w_t.device != x.device:
+[?2004l[?2004h>                 self._prep()
+[?2004l[?2004h>             M, K = x.shape
+[?2004l[?2004h>             N = self._w_t.shape[1]
+[?2004l[?2004h>             out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+[?2004l[?2004h>             bm, bn, bk, gm, nw, ns = _BEST_CONFIG
+[?2004l[?2004h>             grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>             _gemm_bias_kernel[grid](
+[?2004l[?2004h>                 x, self._w_t, self.bias, out,
+[?2004l[?2004h>                 M, N, K,
+[?2004l[?2004h>                 x.stride(0), x.stride(1),
+[?2004l[?2004h>                 self._w_t.stride(0), self._w_t.stride(1),
+[?2004l[?2004h>                 out.stride(0), out.stride(1),
+[?2004l[?2004h>                 BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm,
+[?2004l[?2004h>                 IP="tf32x3", num_warps=nw, num_stages=ns,
+[?2004l[?2004h>             )
+[?2004l[?2004h>             return out
+[?2004l[?2004h>         return F.linear(x, self.weight, self.bias)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# python3 -c "import ast; ast.parse(open('/workspace/solution.py').read())" && echo OK
+[?2004lOK
+[?2004hroot@modal:/# cat > /workspace/bench.py << 'EOF'
+[?2004l[?2004h> import sys, torch, triton
+[?2004l[?2004h> sys.path.insert(0, '/workspace')
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> from solution import _gemm_bias_kernel
+[?2004l[?2004h> 
+[?2004l[?2004h> in_features, out_features, scaling = 4096, 4096, 0.5
+[?2004l[?2004h> batch = 16384
+[?2004l[?2004h> 
+[?2004l[?2004h> class Model(nn.Module):
+[?2004l[?2004h>     def __init__(self, i, o, s):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.matmul = nn.Linear(i, o)
+[?2004l[?2004h>         self.scaling_factor = s
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         x = self.matmul(x)
+[?2004l[?2004h>         ox = x.clone().detach()
+[?2004l[?2004h>         x = x * self.scaling_factor
+[?2004l[?2004h>         return x + ox
+[?2004l[?2004h> 
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> ref = Model(in_features, out_features, scaling).cuda()
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> from solution import ModelNew
+[?2004l[?2004h> new = ModelNew(in_features, out_features, scaling).cuda()
+[?2004l[?2004h> 
+[?2004l[?2004h> x = torch.rand(batch, in_features, device='cuda')
+[?2004l[?2004h> with torch.no_grad():
+[?2004l[?2004h>     r = ref(x)
+[?2004l[?2004h>     o = new(x)
+[?2004l[?2004h> diff = (r - o).abs()
+[?2004l[?2004h> tol = 1e-4 + 1e-4 * r.abs()
+[?2004l[?2004h> print('max abs diff:', diff.max().item())
+[?2004l[?2004h> print('max rel to tol:', (diff / tol).max().item())
+[?2004l[?2004h> print('allclose:', torch.allclose(r, o, atol=1e-4, rtol=1e-4))
+[?2004l[?2004h> print('ref scale (abs mean/max):', r.abs().mean().item(), r.abs().max().item())
+[?2004l[?2004h> 
+[?2004l[?2004h> def clear_l2():
+[?2004l[?2004h>     d = torch.empty((32, 1024, 1024), dtype=torch.int64, device='cuda')
+[?2004l[?2004h>     d.fill_(42)
+[?2004l[?2004h>     del d
+[?2004l[?2004h> 
+[?2004l[?2004h> def time_fn(fn, trials=20):
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         fn(); torch.cuda.synchronize()
+[?2004l[?2004h>     times = []
+[?2004l[?2004h>     for _ in range(trials):
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+[?2004l[?2004h>         clear_l2()
+[?2004l[?2004h>         s.record(); fn(); e.record()
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         times.append(s.elapsed_time(e))
+[?2004l[?2004h>     times = times[1:]
+[?2004l[?2004h>     return sum(times)/len(times), min(times)
+[?2004l[?2004h> 
+[?2004l[?2004h> with torch.no_grad():
+[?2004l[?2004h>     mean, mn = time_fn(lambda: ref(x))
+[?2004l[?2004h> print(f'ref eager: mean {mean:.3f} ms  min {mn:.3f} ms')
+[?2004l[?2004h> 
+[?2004l[?2004h> wt = new._w_t if new._w_t is not None else None
+[?2004l[?2004h> new._prep(); wt = new._w_t
+[?2004l[?2004h> bias = new.bias
+[?2004l[?2004h> M, K = x.shape; N = wt.shape[1]
+[?2004l[?2004h> 
+[?2004l[?2004h> configs = [
+[?2004l[?2004h>     (128,128,32,8,8,3),
+[?2004l[?2004h>     (128,256,32,8,8,3),
+[?2004l[?2004h>     (256,128,32,8,8,3),
+[?2004l[?2004h>     (128,128,64,8,8,3),
+[?2004l[?2004h>     (128,256,64,8,8,4),
+[?2004l[?2004h>     (256,128,64,8,8,4),
+[?2004l[?2004h>     (128,64,64,8,8,4),
+[?2004l[?2004h>     (64,128,64,8,8,4),
+[?2004l[?2004h>     (64,256,64,8,8,4),
+[?2004l[?2004h>     (256,64,64,8,8,4),
+[?2004l[?2004h>     (64,256,32,8,4,4),
+[?2004l[?2004h>     (256,64,32,8,4,4),
+[?2004l[?2004h> ]
+[?2004l[?2004h> for cfg in configs:
+[?2004l[?2004h>     bm, bn, bk, gm, nw, ns = cfg
+[?2004l[?2004h>     out = torch.empty((M, N), device='cuda', dtype=torch.float32)
+[?2004l[?2004h>     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>     def run():
+[?2004l[?2004h>         _gemm_bias_kernel[grid](x, wt, bias, out, M, N, K,
+[?2004l[?2004h>             x.stride(0), x.stride(1), wt.stride(0), wt.stride(1),
+[?2004l[?2004h>             out.stride(0), out.stride(1),
+[?2004l[?2004h>             BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm,
+[?2004l[?2004h>             IP='tf32x3', num_warps=nw, num_stages=ns)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         mean, mn = time_fn(run)
+[?2004l[?2004h>         print(f'cfg {cfg}: mean {mean:.3f} ms  min {mn:.3f} ms')
+[?2004l[?2004h>     except Exception as ex:
+[?2004l[?2004h>         print(f'cfg {cfg}: FAIL {ex}')
+[?2004l[?2004h> 
+[?2004l[?2004h> # also check full model forward timing
+[?2004l[?2004h> with torch.no_grad():
+[?2004l[?2004h>     mean, mn = time_fn(lambda: new(x))
+[?2004l[?2004h> print(f'ModelNew forward: mean {mean:.3f} ms  min {mn:.3f} ms')
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# gpu run -- python3 /workspace/bench.py
+[?2004lrequest ID: 28c4269414024473bcfc15173a7ab4ce
+box: sb-9BqF5ELzovYpkuDHeupOw3
+command: 8d3522c497644d85aac373c067e8f044
+[?2004hroot@modal:/# gpu --help
+[?2004lusage: gpu [-h] [--key KEY] [--timeout TIMEOUT] [--cwd CWD] [--detach] [--config CONFIG] {policy,run,stop,exec,status,wait,push,pull,refresh,sync} [args ...]
+
+GPU boxes through a shared Modal service
+
+positional arguments:
+  {policy,run,stop,exec,status,wait,push,pull,refresh,sync}
+  args
+
+options:
+  -h, --help            show this help message and exit
+  --key KEY             Reuse this request ID after a lost response
+  --timeout TIMEOUT     Optional timeout for the remote command, in seconds
+  --cwd CWD
+  --detach
+  --config CONFIG       Optional JSON config instead of environment configuration
+
+Commands:
+  gpu policy
+  gpu run [options] -- PROGRAM [ARG ...]
+  gpu stop BOX
+  gpu exec BOX [options] -- PROGRAM [ARG ...]
+  gpu status COMMAND
+  gpu wait COMMAND
+  gpu push BOX LOCAL REMOTE
+  gpu pull BOX REMOTE LOCAL
+  gpu refresh BOX
+  gpu sync
+
+run starts a GPU box with its first command and returns command and box IDs.
+The run command is the sandbox entrypoint; when it exits, the box stops.
+exec is available while that box is running.
+run and exec wait unless --detach is set.
+status and wait take the command IDs they return.
+The -- separator starts the remote program and its arguments.
+[?2004hroot@modal:/# gpu status 8d3522c497644d85aac373c067e8f044
+[?2004l{
+  "id": "8d3522c497644d85aac373c067e8f044",
+  "trial": "f7f9b2326d484ce1beb3745d3149a267",
+  "box": "sb-9BqF5ELzovYpkuDHeupOw3",
+  "state": "succeeded",
+  "exit_code": 0
+}
+[?2004hroot@modal:/# gpu run -- bash -c "python3 /workspace/bench.py > /workspace/bench_out.txt 2>&1; echo done"
+[?2004lrequest ID: 27f5b1ea4aaa4f979fe801b79a0b19ed
+box: sb-OTbiNZLax5sdFYfnIBlszX
+command: dea6b0145589429da0e77f602181f4fd
+done
+[?2004hroot@modal:/# gpu sync && cat /workspace/bench_out.txt
+[?2004l{
+  "box": null,
+  "committed": [
+    "agent"
+  ],
+  "reloaded": [
+    "agent"
+  ]
+}
+max abs diff: 8.821487426757812e-06
+max rel to tol: 0.04511733725667
+allclose: True
+ref scale (abs mean/max): 0.4049045145511627 2.7108230590820312
+ref eager: mean 11.404 ms  min 11.391 ms
+cfg (128, 128, 32, 8, 8, 3): mean 14.954 ms  min 14.862 ms
+cfg (128, 256, 32, 8, 8, 3): mean 17.987 ms  min 17.884 ms
+cfg (256, 128, 32, 8, 8, 3): mean 15.298 ms  min 15.197 ms
+cfg (128, 128, 64, 8, 8, 3): mean 13.756 ms  min 13.596 ms
+cfg (128, 256, 64, 8, 8, 4): FAIL out of resource: shared memory, Required: 425984, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
+cfg (256, 128, 64, 8, 8, 4): FAIL out of resource: shared memory, Required: 360448, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
+cfg (128, 64, 64, 8, 8, 4): mean 9.954 ms  min 9.807 ms
+cfg (64, 128, 64, 8, 8, 4): mean 30.348 ms  min 30.238 ms
+cfg (64, 256, 64, 8, 8, 4): FAIL out of resource: shared memory, Required: 376832, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
+cfg (256, 64, 64, 8, 8, 4): FAIL out of resource: shared memory, Required: 278528, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
+cfg (64, 256, 32, 8, 4, 4): mean 31.386 ms  min 31.280 ms
+cfg (256, 64, 32, 8, 4, 4): mean 20.552 ms  min 20.438 ms
+ModelNew forward: mean 14.879 ms  min 14.858 ms
+[?2004hroot@modal:/# cat > /workspace/diag.py << 'EOF'
+[?2004l[?2004h> import torch, torch.nn as nn, torch.nn.functional as F
+[?2004l[?2004h> print('allow_tf32 default:', torch.backends.cuda.matmul.allow_tf32)
+[?2004l[?2004h> print('fp32_precision:', getattr(torch.backends.cuda.matmul, 'fp32_precision', 'n/a'))
+[?2004l[?2004h> 
+[?2004l[?2004h> in_features, out_features, scaling = 4096, 4096, 0.5
+[?2004l[?2004h> batch = 16384
+[?2004l[?2004h> 
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> lin = nn.Linear(in_features, out_features).cuda()
+[?2004l[?2004h> x = torch.rand(batch, in_features, device='cuda')
+[?2004l[?2004h> 
+[?2004l[?2004h> def clear_l2():
+[?2004l[?2004h>     d = torch.empty((32, 1024, 1024), dtype=torch.int64, device='cuda')
+[?2004l[?2004h>     d.fill_(42)
+[?2004l[?2004h>     del d
+[?2004l[?2004h> 
+[?2004l[?2004h> def time_fn(fn, trials=20):
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         fn(); torch.cuda.synchronize()
+[?2004l[?2004h>     times = []
+[?2004l[?2004h>     for _ in range(trials):
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+[?2004l[?2004h>         clear_l2()
+[?2004l[?2004h>         s.record(); fn(); e.record()
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         times.append(s.elapsed_time(e))
+[?2004l[?2004h>     times = times[1:]
+[?2004l[?2004h>     return sum(times)/len(times), min(times)
+[?2004l[?2004h> 
+[?2004l[?2004h> with torch.no_grad():
+[?2004l[?2004h>     print('F.linear fp32:', time_fn(lambda: F.linear(x, lin.weight, lin.bias)))
+[?2004l[?2004h>     torch.backends.cuda.matmul.allow_tf32 = True
+[?2004l[?2004h>     print('F.linear tf32:', time_fn(lambda: F.linear(x, lin.weight, lin.bias)))
+[?2004l[?2004h>     torch.backends.cuda.matmul.allow_tf32 = False
+[?2004l[?2004h>     def full_ref():
+[?2004l[?2004h>         y = F.linear(x, lin.weight, lin.bias)
+[?2004l[?2004h>         oy = y.clone().detach()
+[?2004l[?2004h>         return y * scaling + oy
+[?2004l[?2004h>     print('full ref (fused ops):', time_fn(full_ref))
+[?2004l[?2004h>     y = F.linear(x, lin.weight, lin.bias)
+[?2004l[?2004h>     print('elemwise only:', time_fn(lambda: y * scaling + y))
+[?2004l[?2004h>     print('clone only:', time_fn(lambda: y.clone()))
+[?2004l[?2004h>     # fp16/bf16 matmul timing for reference
+[?2004l[?2004h>     xh = x.half(); wh = lin.weight.half()
+[?2004l[?2004h>     print('F.linear fp16:', time_fn(lambda: F.linear(xh, wh)))
+[?2004l[?2004h>     xb = x.bfloat16(); wb = lin.weight.bfloat16()
+[?2004l[?2004h>     print('F.linear bf16:', time_fn(lambda: F.linear(xb, wb)))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# gpu run -- bash -c "python3 /workspace/diag.py > /workspace/diag_out.txt 2>&1; echo done"
+[?2004lrequest ID: 2d4db33b098a41c2af3c9efe9455a04f
+box: sb-40jrKor71AcYY0CvJPSGYN
+command: 03279b00986342cea64dd7c01f497273
+done
+[?2004hroot@modal:/# gpu sync && cat /workspace/diag_out.txt
+[?2004l{
+  "box": null,
+  "committed": [
+    "agent"
+  ],
+  "reloaded": [
+    "agent"
+  ]
+}
+[?2004hroot@modal:/# ls -la /workspace/ && cat /workspace/diag_out.txt
+[?2004ltotal 16
+drwxr-xr-x 1 root root    0 Nov  2 21:18 [0m[01;34m__pycache__[0m
+-rw-r--r-- 1 root root 3011 Nov  2 21:15 bench.py
+-rw-r--r-- 1 root root 1321 Nov  2 21:19 bench_out.txt
+-rw-r--r-- 1 root root 1855 Nov  2 21:20 diag.py
+-rw-r--r-- 1 root root    0 Nov  2 21:20 diag_out.txt
+-rw-r--r-- 1 root root 2909 Nov  2 21:15 solution.py
+[?2004hroot@modal:/# gpu run -- python3 /workspace/diag.py
+[?2004lrequest ID: 1f256d4155e543099c153dc862de925b
+box: sb-ufwvkuaJE1T1Hp53sK4KqW
+command: 74c0ebedf67449398a6fc038cb6b8449
+/usr/local/lib/python3.10/dist-packages/torch/backends/cuda/__init__.py:131: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
+  return torch._C._get_cublas_allow_tf32()
+allow_tf32 default: False
+fp32_precision: none
+F.linear fp32: (10.785468703822085, 10.765215873718262)
+F.linear tf32: (1.4274138965104755, 1.4215359687805176)
+full ref (fused ops): (11.48209019711143, 11.472831726074219)
+elemwise only: (0.4516496846550389, 0.4498240053653717)
+clone only: (0.1831814740833483, 0.18172800540924072)
+F.linear fp16: (0.7208858948004874, 0.7190399765968323)
+F.linear bf16: (0.690950732482107, 0.6887360215187073)
+[?2004hroot@modal:/# cat > /workspace/solution.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import triton
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> 
+[?2004lx[?2004h> 
+[?2004l [?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_fp16x3_kernel(
+[?2004l[?2004h>     a_ptr, bhi_ptr, blo_ptr, bias_ptr, c_ptr,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     sam, sak, sbk, sbn, scm, scn,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h> 
+[?2004lt[?2004h>     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+[?2004l[?2004h>     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     rk = tl.arange(0, BLOCK_K)
+[?2004l[?2004h> 
+[?2004l)[?2004h>     a_ptrs = a_ptr + rm[:, None] * sam + rk[None, :] * sak
+[?2004l[?2004h>     bhi_ptrs = bhi_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h>     blo_ptrs = blo_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h> 
+[?2004l1[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         a = tl.load(a_ptrs)
+[?2004l[?2004h>         bhi = tl.load(bhi_ptrs)
+[?2004l[?2004h>         blo = tl.load(blo_ptrs)
+[?2004l[?2004h>         a_hi = a.to(tl.float16)
+[?2004l[?2004h>         a_lo = (a - a_hi.to(tl.float32)).to(tl.float16)
+[?2004l[?2004h>         acc = tl.dot(a_hi, bhi, acc)
+[?2004l[?2004h>         acc = tl.dot(a_hi, blo, acc)
+[?2004l[?2004h>         acc = tl.dot(a_lo, bhi, acc)
+[?2004l[?2004h>         a_ptrs += BLOCK_K * sak
+[?2004l[?2004h>         bhi_ptrs += BLOCK_K * sbk
+[?2004l[?2004h>         blo_ptrs += BLOCK_K * sbk
+[?2004l[?2004h> 
+[?2004l [?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h> 
+[?2004l[?2004h>     c_ptrs = c_ptr + rm[:, None] * scm + rn[None, :] * scn
+[?2004l[?2004h>     mask = (rm[:, None] < M) & (rn[None, :] < N)
+[?2004l[?2004h>     tl.store(c_ptrs, acc, mask=mask)
+[?2004l[?2004h> 
+[?2004lr[?2004h> 
+[?2004lu[?2004h> _BEST_CONFIG = (128, 128, 64, 8, 8, 3)
+[?2004l[?2004h> 
+[?2004l][?2004h> 
+[?2004l[?2004h> class ModelNew(nn.Module):
+[?2004l[?2004h>     def __init__(self, in_features, out_features, scaling_factor):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         lin = nn.Linear(in_features, out_features)
+[?2004l[?2004h>         s = 1.0 + float(scaling_factor)
+[?2004l[?2004h>         with torch.no_grad():
+[?2004l[?2004h>             lin.weight.mul_(s)
+[?2004l[?2004h>             lin.bias.mul_(s)
+[?2004l[?2004h>         self.weight = lin.weight
+[?2004l[?2004h>         self.bias = lin.bias
+[?2004l[?2004h>         self._w_hi = None
+[?2004l[?2004h>         self._w_lo = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     def _prep(self):
+[?2004l[?2004h>         w = self.weight.detach()
+[?2004l[?2004h>         w_hi = w.half()
+[?2004l[?2004h>         w_lo = (w - w_hi.float()).half()
+[?2004l[?2004h>         self._w_hi = w_hi.t().contiguous()
+[?2004l[?2004h>         self._w_lo = w_lo.t().contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         if x.is_cuda and x.dtype == torch.float32 and x.dim() == 2:
+[?2004l[?2004h>             if self._w_hi is None or self._w_hi.device != x.device:
+[?2004l[?2004h>                 self._prep()
+[?2004l[?2004h>             M, K = x.shape
+[?2004l[?2004h>             N = self._w_hi.shape[1]
+[?2004l[?2004h>             out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+[?2004l[?2004h>             bm, bn, bk, gm, nw, ns = _BEST_CONFIG
+[?2004l[?2004h>             grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>             _gemm_fp16x3_kernel[grid](
+[?2004l[?2004h>                 x, self._w_hi, self._w_lo, self.bias, out,
+[?2004l[?2004h>                 M, N, K,
+[?2004l[?2004h>                 x.stride(0), x.stride(1),
+[?2004l[?2004h>                 self._w_hi.stride(0), self._w_hi.stride(1),
+[?2004l[?2004h>                 out.stride(0), out.stride(1),
+[?2004l[?2004h>                 BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm,
+[?2004l[?2004h>                 num_warps=nw, num_stages=ns,
+[?2004l[?2004h>             )
+[?2004l[?2004h>             return out
+[?2004l[?2004h>         return F.linear(x, self.weight, self.bias)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# cat > /workspace/bench2.py << 'EOF'
+[?2004l[?2004h> import sys, torch, triton
+[?2004l[?2004h> sys.path.insert(0, '/workspace')
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> from solution import _gemm_fp16x3_kernel, ModelNew
+[?2004l[?2004h> 
+[?2004l[?2004h> in_features, out_features, scaling = 4096, 4096, 0.5
+[?2004l[?2004h> batch = 16384
+[?2004l[?2004h> 
+[?2004l[?2004h> class Model(nn.Module):
+[?2004l[?2004h>     def __init__(self, i, o, s):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.matmul = nn.Linear(i, o)
+[?2004l[?2004h>         self.scaling_factor = s
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         x = self.matmul(x)
+[?2004l[?2004h>         ox = x.clone().detach()
+[?2004l[?2004h>         return x * self.scaling_factor + ox
+[?2004l[?2004h> 
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> ref = Model(in_features, out_features, scaling).cuda()
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> new = ModelNew(in_features, out_features, scaling).cuda()
+[?2004l[?2004h> 
+[?2004l[?2004h> x = torch.rand(batch, in_features, device='cuda')
+[?2004l[?2004h> with torch.no_grad():
+[?2004l[?2004h>     r = ref(x)
+[?2004l[?2004h>     o = new(x)
+[?2004l[?2004h> diff = (r - o).abs()
+[?2004l[?2004h> tol = 1e-4 + 1e-4 * r.abs()
+[?2004l[?2004h> print('max abs diff:', diff.max().item())
+[?2004l[?2004h> print('max rel to tol:', (diff / tol).max().item())
+[?2004l[?2004h> print('allclose:', torch.allclose(r, o, atol=1e-4, rtol=1e-4))
+[?2004l[?2004h> 
+[?2004l[?2004h> def clear_l2():
+[?2004l[?2004h>     d = torch.empty((32, 1024, 1024), dtype=torch.int64, device='cuda')
+[?2004l[?2004h>     d.fill_(42)
+[?2004l[?2004h>     del d
+[?2004l[?2004h> 
+[?2004l[?2004h> def time_fn(fn, trials=20):
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         fn(); torch.cuda.synchronize()
+[?2004l[?2004h>     times = []
+[?2004l[?2004h>     for _ in range(trials):
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+[?2004l[?2004h>         clear_l2()
+[?2004l[?2004h>         s.record(); fn(); e.record()
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         times.append(s.elapsed_time(e))
+[?2004l[?2004h>     times = times[1:]
+[?2004l[?2004h>     return sum(times)/len(times), min(times)
+[?2004l[?2004h> 
+[?2004l[?2004h> with torch.no_grad():
+[?2004l[?2004h>     print('ref eager:', time_fn(lambda: ref(x)))
+[?2004l[?2004h> 
+[?2004l[?2004h> new._prep()
+[?2004l[?2004h> whi, wlo, bias = new._w_hi, new._w_lo, new.bias
+[?2004l[?2004h> M, K = x.shape; N = whi.shape[1]
+[?2004l[?2004h> 
+[?2004l[?2004h> configs = [
+[?2004l[?2004h>     (128,128,64,8,8,3),
+[?2004l[?2004h>     (128,128,64,8,8,4),
+[?2004l[?2004h>     (128,256,64,8,8,3),
+[?2004l[?2004h>     (256,128,64,8,8,3),
+[?2004l[?2004h>     (128,128,32,8,8,4),
+[?2004l[?2004h>     (128,256,32,8,8,3),
+[?2004l[?2004h>     (256,128,32,8,8,3),
+[?2004l[?2004h>     (128,64,64,8,8,4),
+[?2004l[?2004h>     (64,128,64,8,8,4),
+[?2004l[?2004h>     (128,128,128,8,8,3),
+[?2004l[?2004h> ]
+[?2004l[?2004h> best = None
+[?2004l[?2004h> for cfg in configs:
+[?2004l[?2004h>     bm, bn, bk, gm, nw, ns = cfg
+[?2004l[?2004h>     out = torch.empty((M, N), device='cuda', dtype=torch.float32)
+[?2004l[?2004h>     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>     def run():
+[?2004l[?2004h>         _gemm_fp16x3_kernel[grid](x, whi, wlo, bias, out, M, N, K,
+[?2004l[?2004h>             x.stride(0), x.stride(1), whi.stride(0), whi.stride(1),
+[?2004l[?2004h>             out.stride(0), out.stride(1),
+[?2004l[?2004h>             BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm,
+[?2004l[?2004h>             num_warps=nw, num_stages=ns)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         t = time_fn(run)
+[?2004l[?2004h>         print(f'cfg {cfg}: mean {t[0]:.3f} ms  min {t[1]:.3f} ms')
+[?2004l[?2004h>         if best is None or t[0] < best[0]: best = (t[0], cfg)
+[?2004l[?2004h>     except Exception as ex:
+[?2004l[?2004h>         print(f'cfg {cfg}: FAIL {type(ex).__name__}')
+[?2004l[?2004h> print('BEST:', best)
+[?2004l[?2004h> with torch.no_grad():
+[?2004l[?2004h>     print('ModelNew forward:', time_fn(lambda: new(x)))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# gpu run -- python3 /workspace/bench2.py
+[?2004lrequest ID: 757ea90d8e4f40f6b460fd807ade2417
+box: sb-qShSVSIg1ffRQmMYENqMPg
+command: 450236a338b6442f955bae0ca5f3c0df
+max abs diff: 4.363059997558594e-05
+max rel to tol: 0.21826854348182678
+allclose: True
+ref eager: (11.407434262727437, 11.389472007751465)
+cfg (128, 128, 64, 8, 8, 3): mean 3.010 ms  min 2.763 ms
+cfg (128, 128, 64, 8, 8, 4): mean 2.781 ms  min 2.765 ms
+cfg (128, 256, 64, 8, 8, 3): FAIL OutOfResources
+cfg (256, 128, 64, 8, 8, 3): mean 2.666 ms  min 2.650 ms
+cfg (128, 128, 32, 8, 8, 4): mean 2.554 ms  min 2.489 ms
+cfg (128, 256, 32, 8, 8, 3): mean 2.639 ms  min 2.629 ms
+cfg (256, 128, 32, 8, 8, 3): mean 2.684 ms  min 2.576 ms
+cfg (128, 64, 64, 8, 8, 4): mean 3.665 ms  min 3.565 ms
+cfg (64, 128, 64, 8, 8, 4): mean 13.716 ms  min 13.636 ms
+cfg (128, 128, 128, 8, 8, 3): FAIL OutOfResources
+BEST: (2.5542147410543343, (128, 128, 32, 8, 8, 4))
+ModelNew forward: (2.9387503046738472, 2.7528319358825684)
+[?2004hroot@modal:/# cat > /workspace/v2.py << 'EOF'
+[?2004l[?2004h> import torch, triton, torch.nn as nn, torch.nn.functional as F
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> 
+[?2004l_[?2004h> @triton.jit
+[?2004l[?2004h> def _split_kernel(x_ptr, hi_ptr, lo_ptr, n_elem, BLOCK: tl.constexpr):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     offs = pid * BLOCK + tl.arange(0, BLOCK)
+[?2004l[?2004h>     mask = offs < n_elem
+[?2004l[?2004h>     x = tl.load(x_ptr + offs, mask=mask)
+[?2004l[?2004h>     hi = x.to(tl.float16)
+[?2004l[?2004h>     lo = (x - hi.to(tl.float32)).to(tl.float16)
+[?2004l[?2004h>     tl.store(hi_ptr + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(lo_ptr + offs, lo, mask=mask)
+[?2004l[?2004h> 
+[?2004l([?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_v2(
+[?2004l[?2004h>     ahi_ptr, alo_ptr, bhi_ptr, blo_ptr, bias_ptr, c_ptr,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     sam, sak, sbk, sbn, scm, scn,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004lstride(0), whi[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h>     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+[?2004l[?2004h>     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     rk = tl.arange(0, BLOCK_K)
+[?2004l[?2004h>     ahi_ptrs = ahi_ptr + rm[:, None] * sam + rk[None, :] * sak
+[?2004l[?2004h>     alo_ptrs = alo_ptr + rm[:, None] * sam + rk[None, :] * sak
+[?2004l[?2004h>     bhi_ptrs = bhi_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h>     blo_ptrs = blo_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         ahi = tl.load(ahi_ptrs)
+[?2004l[?2004h>         alo = tl.load(alo_ptrs)
+[?2004l[?2004h>         bhi = tl.load(bhi_ptrs)
+[?2004l[?2004h>         blo = tl.load(blo_ptrs)
+[?2004l[?2004h>         acc = tl.dot(ahi, bhi, acc)
+[?2004l[?2004h>         acc = tl.dot(ahi, blo, acc)
+[?2004l[?2004h>         acc = tl.dot(alo, bhi, acc)
+[?2004l[?2004h>         ahi_ptrs += BLOCK_K * sak
+[?2004l[?2004h>         alo_ptrs += BLOCK_K * sak
+[?2004l[?2004h>         bhi_ptrs += BLOCK_K * sbk
+[?2004l[?2004h>         blo_ptrs += BLOCK_K * sbk
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h>     c_ptrs = c_ptr + rm[:, None] * scm + rn[None, :] * scn
+[?2004l[?2004h>     mask = (rm[:, None] < M) & (rn[None, :] < N)
+[?2004l[?2004h>     tl.store(c_ptrs, acc, mask=mask)
+[?2004l[?2004h> 
+[?2004l[?2004h> in_features, out_features, scaling = 4096, 4096, 0.5
+[?2004l[?2004h> batch = 16384
+[?2004l[?2004h> 
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> lin = nn.Linear(in_features, out_features).cuda()
+[?2004l[?2004h> w = lin.weight * 1.5
+[?2004l[?2004h> b = lin.bias * 1.5
+[?2004l[?2004h> x = torch.rand(batch, in_features, device='cuda')
+[?2004l[?2004h> 
+[?2004l[?2004h> w_hi = w.half(); w_lo = (w - w_hi.float()).half()
+[?2004l[?2004h> whi_t = w_hi.t().contiguous(); wlo_t = w_lo.t().contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h> ref = F.linear(x, w, b)
+[?2004l[?2004h> x_hi = x.half(); x_lo = (x - x_hi.float()).half()
+[?2004l[?2004h> M, K = x.shape; N = w.shape[0]
+[?2004l[?2004h> out = torch.empty((M, N), device='cuda', dtype=torch.float32)
+[?2004l[?2004h> _gemm_v2[(triton.cdiv(M,128)*triton.cdiv(N,128),)](x_hi, x_lo, whi_t, wlo_t, b, out, M, N, K,
+[?2004l[?2004h>     x_hi.stride(0), x_hi.stride(1), whi_t.stride(0), whi_t.stride(1), out.stride(0), out.stride(1),
+[?2004l[?2004h>     BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=8, num_stages=3)
+[?2004l[?2004h> d = (ref - out).abs()
+[?2004l[?2004h> tol = 1e-4 + 1e-4*ref.abs()
+[?2004l[?2004h> print('v2 max diff:', d.max().item(), 'rel to tol:', (d/tol).max().item())
+[?2004l[?2004h> 
+[?2004l[?2004h> def clear_l2():
+[?2004l[?2004h>     dd = torch.empty((32, 1024, 1024), dtype=torch.int64, device='cuda')
+[?2004l[?2004h>     dd.fill_(42); del dd
+[?2004l[?2004h> 
+[?2004l[?2004h> def time_fn(fn, trials=20):
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         fn(); torch.cuda.synchronize()
+[?2004l[?2004h>     times = []
+[?2004l[?2004h>     for _ in range(trials):
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+[?2004l[?2004h>         clear_l2()
+[?2004l[?2004h>         s.record(); fn(); e.record()
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         times.append(s.elapsed_time(e))
+[?2004l[?2004h>     times = times[1:]
+[?2004l[?2004h>     return sum(times)/len(times), min(times)
+[?2004l[?2004h> 
+[?2004l[?2004h> n_elem = M*K
+[?2004l[?2004h> def presplit():
+[?2004l[?2004h>     _split_kernel[(triton.cdiv(n_elem, 4096),)](x, x_hi, x_lo, n_elem, BLOCK=4096, num_warps=8)
+[?2004l[?2004h> print('presplit:', time_fn(presplit))
+[?2004l[?2004h> 
+[?2004l[?2004h> configs = [
+[?2004l[?2004h>     (128,128,64,8,8,3),
+[?2004l[?2004h>     (128,128,64,8,8,4),
+[?2004l[?2004h>     (128,128,32,8,8,4),
+[?2004l[?2004h>     (128,128,32,8,8,5),
+[?2004l[?2004h>     (128,256,64,8,8,3),
+[?2004l[?2004h>     (256,128,64,8,8,3),
+[?2004l[?2004h>     (128,256,32,8,8,4),
+[?2004l[?2004h>     (256,128,32,8,8,4),
+[?2004l[?2004h>     (128,128,64,8,4,3),
+[?2004l[?2004h>     (128,128,128,8,8,2),
+[?2004l[?2004h> ]
+[?2004l[?2004h> best=None
+[?2004l[?2004h> for cfg in configs:
+[?2004l[?2004h>     bm, bn, bk, gm, nw, ns = cfg
+[?2004l[?2004h>     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>     def run():
+[?2004l[?2004h>         _gemm_v2[grid](x_hi, x_lo, whi_t, wlo_t, b, out, M, N, K,
+[?2004l[?2004h>             x_hi.stride(0), x_hi.stride(1), whi_t.stride(0), whi_t.stride(1),
+[?2004l[?2004h>             out.stride(0), out.stride(1),
+[?2004l[?2004h>             BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, num_warps=nw, num_stages=ns)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         t = time_fn(run)
+[?2004l[?2004h>         print(f'v2 cfg {cfg}: mean {t[0]:.3f} min {t[1]:.3f}')
+[?2004l[?2004h>         if best is None or t[0] < best[0]: best=(t[0],cfg)
+[?2004l[?2004h>     except Exception as ex:
+[?2004l[?2004h>         print(f'v2 cfg {cfg}: FAIL {type(ex).__name__}')
+[?2004l[?2004h> print('BEST v2:', best)
+[?2004l[?2004h> 
+[?2004l[?2004h> def full():
+[?2004l[?2004h>     presplit()
+[?2004l[?2004h>     bm,bn,bk,gm,nw,ns = best[1]
+[?2004l[?2004h>     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>     _gemm_v2[grid](x_hi, x_lo, whi_t, wlo_t, b, out, M, N, K,
+[?2004l[?2004h>         x_hi.stride(0), x_hi.stride(1), whi_t.stride(0), whi_t.stride(1),
+[?2004l[?2004h>         out.stride(0), out.stride(1),
+[?2004l[?2004h>         BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, num_warps=nw, num_stages=ns)
+[?2004l[?2004h> print('full v2 (presplit+gemm):', time_fn(full))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# gpu run -- python3 /workspace/v2.py
+[?2004lrequest ID: e34a9229424c46fcbca6755cd1ce00fe
+box: sb-SZ5yO9aeCZbaFbS6PSwmxK
+command: 6d7740cd11744c799dec87f8d5edb39a
+v2 max diff: 4.506111145019531e-05 rel to tol: 0.22136613726615906
+presplit: (0.18328421053133512, 0.18188799917697906)
+v2 cfg (128, 128, 64, 8, 8, 3): mean 2.524 min 2.442
+v2 cfg (128, 128, 64, 8, 8, 4): FAIL OutOfResources
+v2 cfg (128, 128, 32, 8, 8, 4): mean 2.678 min 2.665
+v2 cfg (128, 128, 32, 8, 8, 5): mean 2.735 min 2.584
+v2 cfg (128, 256, 64, 8, 8, 3): FAIL OutOfResources
+v2 cfg (256, 128, 64, 8, 8, 3): FAIL OutOfResources
+v2 cfg (128, 256, 32, 8, 8, 4): mean 2.490 min 2.368
+v2 cfg (256, 128, 32, 8, 8, 4): mean 2.475 min 2.355
+v2 cfg (128, 128, 64, 8, 4, 3): mean 2.612 min 2.582
+v2 cfg (128, 128, 128, 8, 8, 2): FAIL OutOfResources
+BEST v2: (2.4748177026447498, (256, 128, 32, 8, 8, 4))
+full v2 (presplit+gemm): (2.541952007695248, 2.5369279384613037)
+[?2004hroot@modal:/# cat > /workspace/v3.py << 'EOF'
+[?2004l[?2004h> import torch, triton, torch.nn as nn, torch.nn.functional as F
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _split_cat_kernel(x_ptr, a3_ptr, M, K, sa, BLOCK: tl.constexpr):
+[?2004l[?2004h>     # writes [x_hi, x_hi, x_lo] into a3 (M, 3K)
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     row = tl.program_id(1)
+[?2004l[?2004h>     offs = pid * BLOCK + tl.arange(0, BLOCK)
+[?2004l[?2004h>     mask = offs < K
+[?2004l[?2004h>     x = tl.load(x_ptr + row * K + offs, mask=mask)
+[?2004l[?2004h>     hi = x.to(tl.float16)
+[?2004l[?2004h>     lo = (x - hi.to(tl.float32)).to(tl.float16)
+[?2004l[?2004h>     base = a3_ptr + row * sa
+[?2004l[?2004h>     tl.store(base + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + K + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + 2 * K + offs, lo, mask=mask)
+[?2004l[?2004h> 
+[?2004lu[?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_std(
+[?2004l[?2004h>     a_ptr, b_ptr, bias_ptr, c_ptr,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     sam, sak, sbk, sbn, scm, scn,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h>     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+[?2004l[?2004h>     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     rk = tl.arange(0, BLOCK_K)
+[?2004l[?2004h>     a_ptrs = a_ptr + rm[:, None] * sam + rk[None, :] * sak
+[?2004l[?2004h>     b_ptrs = b_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         a = tl.load(a_ptrs)
+[?2004l[?2004h>         b = tl.load(b_ptrs)
+[?2004l[?2004h>         acc = tl.dot(a, b, acc)
+[?2004l[?2004h>         a_ptrs += BLOCK_K * sak
+[?2004l[?2004h>         b_ptrs += BLOCK_K * sbk
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h>     c_ptrs = c_ptr + rm[:, None] * scm + rn[None, :] * scn
+[?2004l[?2004h>     mask = (rm[:, None] < M) & (rn[None, :] < N)
+[?2004l[?2004h>     tl.store(c_ptrs, acc, mask=mask)
+[?2004l[?2004h> 
+[?2004l[?2004h> in_features, out_features, scaling = 4096, 4096, 0.5
+[?2004l[?2004h> batch = 16384
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> lin = nn.Linear(in_features, out_features).cuda()
+[?2004l[?2004h> w = lin.weight * 1.5
+[?2004l[?2004h> b = (lin.bias * 1.5).contiguous()
+[?2004l[?2004h> x = torch.rand(batch, in_features, device='cuda')
+[?2004l[?2004h> ref = F.linear(x, w, b)
+[?2004l[?2004h> 
+[?2004l[?2004h> w_hi = w.half(); w_lo = (w - w_hi.float()).half()
+[?2004l[?2004h> B3 = torch.cat([w_hi, w_lo, w_hi], dim=0).t().contiguous()  # (3K, N)
+[?2004l[?2004h> M, K = x.shape; N = w.shape[0]; K3 = 3*K
+[?2004l[?2004h> A3 = torch.empty((M, K3), device='cuda', dtype=torch.float16)
+[?2004l[?2004h> out = torch.empty((M, N), device='cuda', dtype=torch.float32)
+[?2004l[?2004h> 
+[?2004l[?2004h> grid_split = (triton.cdiv(K, 1024), M)
+[?2004l[?2004h> _split_cat_kernel[grid_split](x, A3, M, K, A3.stride(0), BLOCK=1024)
+[?2004l[?2004h> _gemm_std[(triton.cdiv(M,128)*triton.cdiv(N,128),)](A3, B3, b, out, M, N, K3,
+[?2004l[?2004h>     A3.stride(0), A3.stride(1), B3.stride(0), B3.stride(1), out.stride(0), out.stride(1),
+[?2004l[?2004h>     BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, GROUP_M=8, num_warps=8, num_stages=3)
+[?2004l[?2004h> d = (ref - out).abs()
+[?2004l[?2004h> tol = 1e-4 + 1e-4*ref.abs()
+[?2004l[?2004h> print('v3 max diff:', d.max().item(), 'rel to tol:', (d/tol).max().item())
+[?2004l[?2004h> 
+[?2004l[?2004h> def clear_l2():
+[?2004l[?2004h>     dd = torch.empty((32, 1024, 1024), dtype=torch.int64, device='cuda')
+[?2004l[?2004h>     dd.fill_(42); del dd
+[?2004l[?2004h> 
+[?2004l[?2004h> def time_fn(fn, trials=20):
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         fn(); torch.cuda.synchronize()
+[?2004l[?2004h>     times = []
+[?2004l[?2004h>     for _ in range(trials):
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+[?2004l[?2004h>         clear_l2()
+[?2004l[?2004h>         s.record(); fn(); e.record()
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         times.append(s.elapsed_time(e))
+[?2004l[?2004h>     times = times[1:]
+[?2004l[?2004h>     return sum(times)/len(times), min(times)
+[?2004l[?2004h> 
+[?2004l[?2004h> def split_only():
+[?2004l[?2004h>     _split_cat_kernel[grid_split](x, A3, M, K, A3.stride(0), BLOCK=1024)
+[?2004l[?2004h> print('split+cat:', time_fn(split_only))
+[?2004l[?2004h> 
+[?2004l[?2004h> configs = [
+[?2004l[?2004h>     (128,128,64,8,8,3),
+[?2004l[?2004h>     (128,256,64,8,8,3),
+[?2004l[?2004h>     (256,128,64,8,8,3),
+[?2004l[?2004h>     (128,256,64,8,8,4),
+[?2004l[?2004h>     (128,128,128,8,8,3),
+[?2004l[?2004h>     (128,256,128,8,8,2),
+[?2004l[?2004h>     (256,128,128,8,8,2),
+[?2004l[?2004h>     (128,128,64,8,4,4),
+[?2004l[?2004h> ]
+[?2004l[?2004h> best=None
+[?2004l[?2004h> for cfg in configs:
+[?2004l[?2004h>     bm, bn, bk, gm, nw, ns = cfg
+[?2004l[?2004h>     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>     def run():
+[?2004l[?2004h>         _gemm_std[grid](A3, B3, b, out, M, N, K3,
+[?2004l[?2004h>             A3.stride(0), A3.stride(1), B3.stride(0), B3.stride(1),
+[?2004l[?2004h>             out.stride(0), out.stride(1),
+[?2004l[?2004h>             BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, num_warps=nw, num_stages=ns)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         t = time_fn(run)
+[?2004l[?2004h>         print(f'v3 cfg {cfg}: mean {t[0]:.3f} min {t[1]:.3f}')
+[?2004l[?2004h>         if best is None or t[0] < best[0]: best=(t[0],cfg)
+[?2004l[?2004h>     except Exception as ex:
+[?2004l[?2004h>         print(f'v3 cfg {cfg}: FAIL {type(ex).__name__}')
+[?2004l[?2004h> print('BEST v3:', best)
+[?2004l[?2004h> 
+[?2004l[?2004h> bm,bn,bk,gm,nw,ns = best[1]
+[?2004l[?2004h> def full():
+[?2004l[?2004h>     split_only()
+[?2004l[?2004h>     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>     _gemm_std[grid](A3, B3, b, out, M, N, K3,
+[?2004l[?2004h>         A3.stride(0), A3.stride(1), B3.stride(0), B3.stride(1),
+[?2004l[?2004h>         out.stride(0), out.stride(1),
+[?2004l[?2004h>         BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, num_warps=nw, num_stages=ns)
+[?2004l[?2004h> print('full v3:', time_fn(full))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# gpu run -- python3 /workspace/v3.py
+[?2004lrequest ID: 9de2505cfea7440080e59d2de0452b98
+box: sb-76u501mRTLaYEQ1Hm1H2lI
+command: f7b879f365014597aac7a65d363e32ae
+[?2004hroot@modal:/# gpu wait f7b879f365014597aac7a65d363e32ae
+[?2004l[?2004hroot@modal:/# gpu run -- bash -c "python3 /workspace/v3.py > /workspace/v3_out.txt 2>&1; echo done"
+[?2004lrequest ID: a477a30ce29f43e5aafe5947615968b4
+box: sb-0fNxecWFVGR7ZQ0SPvIGyL
+command: 98692dc7d8f34c6d990f03435131872c
+done
+[?2004hroot@modal:/# gpu sync; cat /workspace/v3_out.txt
+[?2004l{
+  "box": null,
+  "committed": [
+    "agent"
+  ],
+  "reloaded": [
+    "agent"
+  ]
+}
+v3 max diff: 1099.8074951171875 rel to tol: 10870475.0
+split+cat: (0.22933389481745267, 0.22867199778556824)
+v3 cfg (128, 128, 64, 8, 8, 3): mean 3.080 min 3.026
+v3 cfg (128, 256, 64, 8, 8, 3): mean 2.415 min 2.404
+v3 cfg (256, 128, 64, 8, 8, 3): mean 2.434 min 2.346
+v3 cfg (128, 256, 64, 8, 8, 4): mean 2.197 min 2.189
+v3 cfg (128, 128, 128, 8, 8, 3): mean 2.879 min 2.726
+v3 cfg (128, 256, 128, 8, 8, 2): mean 3.362 min 3.343
+v3 cfg (256, 128, 128, 8, 8, 2): mean 3.856 min 3.720
+v3 cfg (128, 128, 64, 8, 4, 4): mean 2.528 min 2.505
+BEST v3: (2.196892625407169, (128, 256, 64, 8, 8, 4))
+full v3: (2.722132218511481, 2.693311929702759)
+[?2004hroot@modal:/# cat > /workspace/v4.py << 'EOF'
+[?2004l[?2004h> import torch, triton, torch.nn as nn, torch.nn.functional as F
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _split_cat_kernel(x_ptr, a3_ptr, M, K, sa, BLOCK: tl.constexpr):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     row = tl.program_id(1)
+[?2004l[?2004h>     offs = pid * BLOCK + tl.arange(0, BLOCK)
+[?2004l[?2004h>     mask = offs < K
+[?2004l[?2004h>     x = tl.load(x_ptr + row * K + offs, mask=mask)
+[?2004l[?2004h>     hi = x.to(tl.float16)
+[?2004l[?2004h>     lo = (x - hi.to(tl.float32)).to(tl.float16)
+[?2004l[?2004h>     base = a3_ptr + row * sa
+[?2004l[?2004h>     tl.store(base + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + K + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + 2 * K + offs, lo, mask=mask)
+[?2004l[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_std(
+[?2004l[?2004h>     a_ptr, b_ptr, bias_ptr, c_ptr,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     sam, sak, sbk, sbn, scm, scn,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h>     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+[?2004l[?2004h>     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     rk = tl.arange(0, BLOCK_K)
+[?2004l[?2004h>     a_ptrs = a_ptr + rm[:, None] * sam + rk[None, :] * sak
+[?2004l[?2004h>     b_ptrs = b_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         a = tl.load(a_ptrs)
+[?2004l[?2004h>         b = tl.load(b_ptrs)
+[?2004l[?2004h>         acc = tl.dot(a, b, acc)
+[?2004l[?2004h>         a_ptrs += BLOCK_K * sak
+[?2004l[?2004h>         b_ptrs += BLOCK_K * sbk
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h>     c_ptrs = c_ptr + rm[:, None] * scm + rn[None, :] * scn
+[?2004l[?2004h>     mask = (rm[:, None] < M) & (rn[None, :] < N)
+[?2004l[?2004h>     tl.store(c_ptrs, acc, mask=mask)
+[?2004l[?2004h> 
+[?2004l[?2004h> in_features, out_features, scaling = 4096, 4096, 0.5
+[?2004l[?2004h> batch = 16384
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> lin = nn.Linear(in_features, out_features).cuda()
+[?2004l[?2004h> w = lin.weight * 1.5
+[?2004l[?2004h> b = (lin.bias * 1.5).contiguous()
+[?2004l[?2004h> x = torch.rand(batch, in_features, device='cuda')
+[?2004l[?2004h> ref = F.linear(x, w, b)
+[?2004l[?2004h> 
+[?2004l[?2004h> w_hi = w.half(); w_lo = (w - w_hi.float()).half()
+[?2004l[?2004h> B3 = torch.cat([w_hi.t(), w_lo.t(), w_hi.t()], dim=0).contiguous()  # (3K, N)
+[?2004l[?2004h> M, K = x.shape; N = w.shape[0]; K3 = 3*K
+[?2004l[?2004h> A3 = torch.empty((M, K3), device='cuda', dtype=torch.float16)
+[?2004l[?2004h> out = torch.empty((M, N), device='cuda', dtype=torch.float32)
+[?2004l[?2004h> 
+[?2004l[?2004h> grid_split = (triton.cdiv(K, 1024), M)
+[?2004l[?2004h> _split_cat_kernel[grid_split](x, A3, M, K, A3.stride(0), BLOCK=1024)
+[?2004l[?2004h> _gemm_std[(triton.cdiv(M,128)*triton.cdiv(N,256),)](A3, B3, b, out, M, N, K3,
+[?2004l[?2004h>     A3.stride(0), A3.stride(1), B3.stride(0), B3.stride(1), out.stride(0), out.stride(1),
+[?2004l[?2004h>     BLOCK_M=128, BLOCK_N=256, BLOCK_K=64, GROUP_M=8, num_warps=8, num_stages=4)
+[?2004l[?2004h> d = (ref - out).abs()
+[?2004l[?2004h> tol = 1e-4 + 1e-4*ref.abs()
+[?2004l[?2004h> print('v4 max diff:', d.max().item(), 'rel to tol:', (d/tol).max().item())
+[?2004l[?2004h> 
+[?2004l[?2004h> def clear_l2():
+[?2004l[?2004h>     dd = torch.empty((32, 1024, 1024), dtype=torch.int64, device='cuda')
+[?2004l[?2004h>     dd.fill_(42); del dd
+[?2004l[?2004h> 
+[?2004l[?2004h> def time_fn(fn, trials=20):
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         fn(); torch.cuda.synchronize()
+[?2004l[?2004h>     times = []
+[?2004l[?2004h>     for _ in range(trials):
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+[?2004l[?2004h>         clear_l2()
+[?2004l[?2004h>         s.record(); fn(); e.record()
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         times.append(s.elapsed_time(e))
+[?2004l[?2004h>     times = times[1:]
+[?2004l[?2004h>     return sum(times)/len(times), min(times)
+[?2004l[?2004h> 
+[?2004l[?2004h> # ceiling: cublas fp16 gemm same shape (fp16 out)
+[?2004l[?2004h> A3c = torch.rand((M, K3), device='cuda', dtype=torch.float16)
+[?2004l[?2004h> print('cublas fp16 (M,3K)@(3K,N):', time_fn(lambda: A3c @ B3))
+[?2004l[?2004h> 
+[?2004l[?2004h> configs = [
+[?2004l[?2004h>     (128,256,64,8,8,4),
+[?2004l[?2004h>     (128,256,64,8,8,5),
+[?2004l[?2004h>     (128,256,64,8,4,4),
+[?2004l[?2004h>     (256,128,64,8,8,4),
+[?2004l[?2004h>     (128,256,32,8,8,6),
+[?2004l[?2004h>     (64,256,64,8,4,4),
+[?2004l[?2004h> ]
+[?2004l[?2004h> best=None
+[?2004l[?2004h> for cfg in configs:
+[?2004l[?2004h>     bm, bn, bk, gm, nw, ns = cfg
+[?2004l[?2004h>     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>     def run():
+[?2004l[?2004h>         _gemm_std[grid](A3, B3, b, out, M, N, K3,
+[?2004l[?2004h>             A3.stride(0), A3.stride(1), B3.stride(0), B3.stride(1),
+[?2004l[?2004h>             out.stride(0), out.stride(1),
+[?2004l[?2004h>             BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, num_warps=nw, num_stages=ns)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         t = time_fn(run)
+[?2004l[?2004h>         print(f'v4 cfg {cfg}: mean {t[0]:.3f} min {t[1]:.3f}')
+[?2004l[?2004h>         if best is None or t[0] < best[0]: best=(t[0],cfg)
+[?2004l[?2004h>     except Exception as ex:
+[?2004l[?2004h>         print(f'v4 cfg {cfg}: FAIL {type(ex).__name__}')
+[?2004l[?2004h> print('BEST v4:', best)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# gpu run -- bash -c "python3 /workspace/v4.py > /workspace/v4_out.txt 2>&1; echo done"
+[?2004lrequest ID: 9594b66773ad4c89af0f4cc6299b8b4b
+box: sb-6BowCYtaxNGkhYjG84X7tp
+command: e81450ad071143258f7dc901fc803fbe
+done
+[?2004hroot@modal:/# gpu sync; cat /workspace/v4_out.txt
+[?2004l{
+  "box": null,
+  "committed": [
+    "agent"
+  ],
+  "reloaded": [
+    "agent"
+  ]
+}
+v4 max diff: 7.343292236328125e-05 rel to tol: 0.23888657987117767
+cublas fp16 (M,3K)@(3K,N): (2.0982720098997416, 2.0618879795074463)
+v4 cfg (128, 256, 64, 8, 8, 4): mean 2.213 min 2.208
+v4 cfg (128, 256, 64, 8, 8, 5): FAIL OutOfResources
+v4 cfg (128, 256, 64, 8, 4, 4): mean 15.994 min 15.822
+v4 cfg (256, 128, 64, 8, 8, 4): mean 2.342 min 2.331
+v4 cfg (128, 256, 32, 8, 8, 6): mean 2.304 min 2.230
+v4 cfg (64, 256, 64, 8, 4, 4): mean 2.612 min 2.598
+BEST v4: (2.2133271568699886, (128, 256, 64, 8, 8, 4))
+[?2004hroot@modal:/# cat > /workspace/v5.py << 'EOF'
+[?2004l[?2004h> import torch, triton, torch.nn as nn, torch.nn.functional as F
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> from triton.tools.tensor_descriptor import TensorDescriptor
+[?2004l[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _split_cat_kernel(x_ptr, a3_ptr, M, K, sa, BLOCK: tl.constexpr):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l [?2004h>     row = tl.program_id(1)
+[?2004l[?2004h>     offs = pid * BLOCK + tl.arange(0, BLOCK)
+[?2004l[?2004h>     mask = offs < K
+[?2004l[?2004h>     x = tl.load(x_ptr + row * K + offs, mask=mask)
+[?2004l[?2004h>     hi = x.to(tl.float16)
+[?2004l[?2004h>     lo = (x - hi.to(tl.float32)).to(tl.float16)
+[?2004l[?2004h>     base = a3_ptr + row * sa
+[?2004l[?2004h>     tl.store(base + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + K + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + 2 * K + offs, lo, mask=mask)
+[?2004l[?2004h> 
+[?2004ld[?2004h> @triton.jit
+[?2004ln[?2004h> def _gemm_tma(
+[?2004l[?2004h>     a_desc, b_desc, bias_ptr, c_desc,
+[?2004l[?2004h>     M, N, K,
+[?2004lt[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004lr[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h>     off_m = pid_m * BLOCK_M
+[?2004l[?2004h>     off_n = pid_n * BLOCK_N
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         a = a_desc.load([off_m, k * BLOCK_K])
+[?2004l[?2004h>         b = b_desc.load([k * BLOCK_K, off_n])
+[?2004l[?2004h>         acc = tl.dot(a, b, acc)
+[?2004l[?2004h>     rn = off_n + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h>     c_desc.store([off_m, off_n], acc.to(tl.float32))
+[?2004l[?2004h> 
+[?2004l[?2004h> in_features, out_features, scaling = 4096, 4096, 0.5
+[?2004l[?2004h> batch = 16384
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> lin = nn.Linear(in_features, out_features).cuda()
+[?2004l[?2004h> w = lin.weight * 1.5
+[?2004l[?2004h> b = (lin.bias * 1.5).contiguous()
+[?2004l[?2004h> x = torch.rand(batch, in_features, device='cuda')
+[?2004l[?2004h> ref = F.linear(x, w, b)
+[?2004l[?2004h> 
+[?2004l[?2004h> w_hi = w.half(); w_lo = (w - w_hi.float()).half()
+[?2004l[?2004h> B3 = torch.cat([w_hi.t(), w_lo.t(), w_hi.t()], dim=0).contiguous()
+[?2004l[?2004h> M, K = x.shape; N = w.shape[0]; K3 = 3*K
+[?2004l[?2004h> A3 = torch.empty((M, K3), device='cuda', dtype=torch.float16)
+[?2004l[?2004h> out = torch.empty((M, N), device='cuda', dtype=torch.float32)
+[?2004l[?2004h> 
+[?2004l[?2004h> grid_split = (triton.cdiv(K, 2048), M)
+[?2004l[?2004h> _split_cat_kernel[grid_split](x, A3, M, K, A3.stride(0), BLOCK=2048, num_warps=8)
+[?2004l[?2004h> 
+[?2004l[?2004h> def clear_l2():
+[?2004l[?2004h>     dd = torch.empty((32, 1024, 1024), dtype=torch.int64, device='cuda')
+[?2004l[?2004h>     dd.fill_(42); del dd
+[?2004l[?2004h> 
+[?2004l[?2004h> def time_fn(fn, trials=20):
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         fn(); torch.cuda.synchronize()
+[?2004l[?2004h>     times = []
+[?2004l[?2004h>     for _ in range(trials):
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+[?2004l[?2004h>         clear_l2()
+[?2004l[?2004h>         s.record(); fn(); e.record()
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         times.append(s.elapsed_time(e))
+[?2004l[?2004h>     times = times[1:]
+[?2004l[?2004h>     return sum(times)/len(times), min(times)
+[?2004l[?2004h> 
+[?2004l[?2004h> def split_only():
+[?2004l[?2004h>     _split_cat_kernel[grid_split](x, A3, M, K, A3.stride(0), BLOCK=2048, num_warps=8)
+[?2004l[?2004h> print('split+cat v5:', time_fn(split_only))
+[?2004l[?2004h> 
+[?2004l[?2004h> # correctness of tma kernel
+[?2004l[?2004h> bm, bn, bk = 128, 256, 64
+[?2004l[?2004h> a_desc = TensorDescriptor(A3, A3.shape, A3.stride(), [bm, bk])
+[?2004l[?2004h> b_desc = TensorDescriptor(B3, B3.shape, B3.stride(), [bk, bn])
+[?2004l[?2004h> c_desc = TensorDescriptor(out, out.shape, out.stride(), [bm, bn])
+[?2004l[?2004h> grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h> _gemm_tma[grid](a_desc, b_desc, b, c_desc, M, N, K3, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8, num_warps=8, num_stages=4)
+[?2004l[?2004h> d = (ref - out).abs()
+[?2004l[?2004h> tol = 1e-4 + 1e-4*ref.abs()
+[?2004l[?2004h> print('v5 tma max diff:', d.max().item(), 'rel:', (d/tol).max().item())
+[?2004l[?2004h> 
+[?2004l[?2004h> configs = [
+[?2004l[?2004h>     (128,256,64,8,8,4),
+[?2004l[?2004h>     (128,256,64,8,8,3),
+[?2004l[?2004h>     (256,128,64,8,8,3),
+[?2004l[?2004h>     (128,128,64,8,8,4),
+[?2004l[?2004h>     (128,256,128,8,8,2),
+[?2004l[?2004h>     (256,128,128,8,8,2),
+[?2004l[?2004h>     (128,512,64,8,8,2),
+[?2004l[?2004h>     (256,256,64,8,8,2),
+[?2004l[?2004h> ]
+[?2004l[?2004h> best=None
+[?2004l[?2004h> for cfg in configs:
+[?2004l[?2004h>     bm, bn, bk, gm, nw, ns = cfg
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         a_desc = TensorDescriptor(A3, A3.shape, A3.stride(), [bm, bk])
+[?2004l[?2004h>         b_desc = TensorDescriptor(B3, B3.shape, B3.stride(), [bk, bn])
+[?2004l[?2004h>         c_desc = TensorDescriptor(out, out.shape, out.stride(), [bm, bn])
+[?2004l[?2004h>         grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>         def run():
+[?2004l[?2004h>             _gemm_tma[grid](a_desc, b_desc, b, c_desc, M, N, K3, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, num_warps=nw, num_stages=ns)
+[?2004l[?2004h>         t = time_fn(run)
+[?2004l[?2004h>         print(f'v5 tma cfg {cfg}: mean {t[0]:.3f} min {t[1]:.3f}')
+[?2004l[?2004h>         if best is None or t[0] < best[0]: best=(t[0],cfg)
+[?2004l[?2004h>     except Exception as ex:
+[?2004l[?2004h>         print(f'v5 tma cfg {cfg}: FAIL {type(ex).__name__}: {ex}')
+[?2004l[?2004h> print('BEST v5:', best)
+[?2004l[?2004h> 
+[?2004l[?2004h> bm,bn,bk,gm,nw,ns = best[1]
+[?2004l[?2004h> a_desc = TensorDescriptor(A3, A3.shape, A3.stride(), [bm, bk])
+[?2004l[?2004h> b_desc = TensorDescriptor(B3, B3.shape, B3.stride(), [bk, bn])
+[?2004l[?2004h> c_desc = TensorDescriptor(out, out.shape, out.stride(), [bm, bn])
+[?2004l[?2004h> def full():
+[?2004l[?2004h>     split_only()
+[?2004l[?2004h>     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>     _gemm_tma[grid](a_desc, b_desc, b, c_desc, M, N, K3, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, num_warps=nw, num_stages=ns)
+[?2004l[?2004h> print('full v5:', time_fn(full))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# gpu run -- bash -c "python3 /workspace/v5.py > /workspace/v5_out.txt 2>&1; echo done"
+[?2004lrequest ID: 766075df31504cc0a1989a1453afb701
+box: sb-B04mmkhJlc3TAmyVqa7N61
+command: 321de7515acf44ab93f8b4a011b1eef2
+done
+[?2004hroot@modal:/# gpu sync; cat /workspace/v5_out.txt
+[?2004l{
+  "box": null,
+  "committed": [
+    "agent"
+  ],
+  "reloaded": [
+    "agent"
+  ]
+}
+split+cat v5: (0.23059031602583432, 0.22966399788856506)
+v5 tma max diff: 7.343292236328125e-05 rel: 0.23888657987117767
+v5 tma cfg (128, 256, 64, 8, 8, 4): mean 2.182 min 2.151
+v5 tma cfg (128, 256, 64, 8, 8, 3): mean 2.190 min 2.150
+v5 tma cfg (256, 128, 64, 8, 8, 3): mean 2.306 min 2.282
+v5 tma cfg (128, 128, 64, 8, 8, 4): mean 2.581 min 2.534
+v5 tma cfg (128, 256, 128, 8, 8, 2): mean 3.168 min 3.124
+v5 tma cfg (256, 128, 128, 8, 8, 2): mean 3.935 min 3.889
+v5 tma cfg (128, 512, 64, 8, 8, 2): FAIL OutOfResources: out of resource: shared memory, Required: 262144, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
+v5 tma cfg (256, 256, 64, 8, 8, 2): FAIL OutOfResources: out of resource: shared memory, Required: 262144, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
+BEST v5: (2.1819469426807605, (128, 256, 64, 8, 8, 4))
+full v5: (2.398219761095549, 2.3816959857940674)
+[?2004hroot@modal:/# cat > /workspace/solution.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import triton
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> 
+[?2004l=[?2004h> try:
+[?2004l[?2004h>     from triton.tools.tensor_descriptor import TensorDescriptor
+[?2004l[?2004h>     _HAS_TD = True
+[?2004l[?2004h> except Exception:
+[?2004l[?2004h>     _HAS_TD = False
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _split_cat_kernel(x_ptr, a3_ptr, M, K, sa, BLOCK: tl.constexpr):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     row = tl.program_id(1)
+[?2004l[?2004h>     offs = pid * BLOCK + tl.arange(0, BLOCK)
+[?2004l[?2004h>     mask = offs < K
+[?2004l[?2004h>     x = tl.load(x_ptr + row * K + offs, mask=mask)
+[?2004l[?2004h>     hi = x.to(tl.float16)
+[?2004l[?2004h>     lo = (x - hi.to(tl.float32)).to(tl.float16)
+[?2004l[?2004h>     base = a3_ptr + row * sa
+[?2004l[?2004h>     tl.store(base + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + K + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + 2 * K + offs, lo, mask=mask)
+[?2004l[?2004h> 
+[?2004l,[?2004h> 
+[?2004l [?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_tma(
+[?2004l[?2004h>     a_desc, b_desc, bias_ptr, c_desc,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h>     off_m = pid_m * BLOCK_M
+[?2004l[?2004h>     off_n = pid_n * BLOCK_N
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         a = a_desc.load([off_m, k * BLOCK_K])
+[?2004l[?2004h>         b = b_desc.load([k * BLOCK_K, off_n])
+[?2004l[?2004h>         acc = tl.dot(a, b, acc)
+[?2004l[?2004h>     rn = off_n + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h>     c_desc.store([off_m, off_n], acc.to(tl.float32))
+[?2004l[?2004h> 
+[?2004li[?2004h> 
+[?2004la[?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_masked(
+[?2004l[?2004h>     a_ptr, b_ptr, bias_ptr, c_ptr,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     sam, sak, sbk, sbn, scm, scn,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr, EVEN_K: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h>     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+[?2004l[?2004h>     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     rk = tl.arange(0, BLOCK_K)
+[?2004l[?2004h>     a_ptrs = a_ptr + rm[:, None] * sam + rk[None, :] * sak
+[?2004l[?2004h>     b_ptrs = b_ptr + rk[:, None] * sbk + rn[None, :] * sbn
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         if EVEN_K:
+[?2004l[?2004h>             a = tl.load(a_ptrs)
+[?2004l[?2004h>             b = tl.load(b_ptrs)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             krem = K - k * BLOCK_K
+[?2004l[?2004h>             a = tl.load(a_ptrs, mask=rk[None, :] < krem, other=0.0)
+[?2004l[?2004h>             b = tl.load(b_ptrs, mask=rk[:, None] < krem, other=0.0)
+[?2004l[?2004h>         acc = tl.dot(a, b, acc)
+[?2004l[?2004h>         a_ptrs += BLOCK_K * sak
+[?2004l[?2004h>         b_ptrs += BLOCK_K * sbk
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h>     c_ptrs = c_ptr + rm[:, None] * scm + rn[None, :] * scn
+[?2004l[?2004h>     mask = (rm[:, None] < M) & (rn[None, :] < N)
+[?2004l[?2004h>     tl.store(c_ptrs, acc, mask=mask)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ModelNew(nn.Module):
+[?2004l[?2004h>     def __init__(self, in_features, out_features, scaling_factor):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         lin = nn.Linear(in_features, out_features)
+[?2004l[?2004h>         s = 1.0 + float(scaling_factor)
+[?2004l[?2004h>         with torch.no_grad():
+[?2004l[?2004h>             lin.weight.mul_(s)
+[?2004l[?2004h>             lin.bias.mul_(s)
+[?2004l[?2004h>         self.weight = lin.weight
+[?2004l[?2004h>         self.bias = lin.bias
+[?2004l[?2004h>         self._b3 = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     def _prep(self, device):
+[?2004l[?2004h>         w = self.weight.detach()
+[?2004l[?2004h>         w_hi = w.half()
+[?2004l[?2004h>         w_lo = (w - w_hi.float()).half()
+[?2004l[?2004h>         self._b3 = torch.cat([w_hi.t(), w_lo.t(), w_hi.t()], dim=0).contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         if x.is_cuda and x.dtype == torch.float32 and x.dim() == 2 and x.is_contiguous():
+[?2004l[?2004h>             M, K = x.shape
+[?2004l[?2004h>             N = self.weight.shape[0]
+[?2004l[?2004h>             if self._b3 is None or self._b3.device != x.device:
+[?2004l[?2004h>                 self._prep(x.device)
+[?2004l[?2004h>             b3 = self._b3
+[?2004l[?2004h>             bias = self.bias
+[?2004l[?2004h>             K3 = 3 * K
+[?2004l[?2004h>             a3 = torch.empty((M, K3), device=x.device, dtype=torch.float16)
+[?2004l[?2004h>             grid_split = (triton.cdiv(K, 2048), M)
+[?2004l[?2004h>             _split_cat_kernel[grid_split](x, a3, M, K, a3.stride(0), BLOCK=2048, num_warps=8)
+[?2004l[?2004h>             out = torch.empty((M, N), device=x.device, dtype=torch.float32)
+[?2004l[?2004h>             if _HAS_TD and M % 128 == 0 and K % 64 == 0 and N % 256 == 0:
+[?2004l[?2004h>                 bm, bn, bk, gm, nw, ns = 128, 256, 64, 8, 8, 4
+[?2004l[?2004h>                 a_desc = TensorDescriptor(a3, a3.shape, a3.stride(), [bm, bk])
+[?2004l[?2004h>                 b_desc = TensorDescriptor(b3, b3.shape, b3.stride(), [bk, bn])
+[?2004l[?2004h>                 c_desc = TensorDescriptor(out, out.shape, out.stride(), [bm, bn])
+[?2004l[?2004h>                 grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>                 _gemm_tma[grid](a_desc, b_desc, bias, c_desc, M, N, K3,
+[?2004l[?2004h>                                 BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm,
+[?2004l[?2004h>                                 num_warps=nw, num_stages=ns)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 bm, bn, bk, gm, nw, ns = 128, 128, 64, 8, 8, 3
+[?2004l[?2004h>                 grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>                 _gemm_masked[grid](a3, b3, bias, out, M, N, K3,
+[?2004l[?2004h>                                    a3.stride(0), a3.stride(1),
+[?2004l[?2004h>                                    b3.stride(0), b3.stride(1),
+[?2004l[?2004h>                                    out.stride(0), out.stride(1),
+[?2004l[?2004h>                                    BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm,
+[?2004l[?2004h>                                    EVEN_K=(K3 % bk == 0),
+[?2004l[?2004h>                                    num_warps=nw, num_stages=ns)
+[?2004l[?2004h>             return out
+[?2004l[?2004h>         return F.linear(x, self.weight, self.bias)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# python3 -c "import ast; ast.parse(open('/workspace/solution.py').read())" && echo PARSE_OK
+[?2004lPARSE_OK
+[?2004hroot@modal:/# gpu run -- bash -c "cd /workspace && python3 /opt/task/evaluate.py /workspace/solution.py --output /workspace/eval1.json > /workspace/eval1_out.txt 2>&1; echo done"
+[?2004lrequest ID: 4ee38427d5e04e518eae8dd7429bc24d
+box: sb-4I7VNlIfcHr3soc4ue20F2
+command: 8e917018cd2749dcbff1564823473124
+done
+[?2004hroot@modal:/# gpu sync; tail -40 /workspace/eval1_out.txt; cat /workspace/eval1.json 2>/dev/null | python3 -m json.tool | head -40
+[?2004l{
+  "box": null,
+  "committed": [
+    "agent"
+  ],
+  "reloaded": [
+    "agent"
+  ]
+}
+[Profiling] Using timing method: cuda_event
+[Profiling] Using device: 0 NVIDIA H100 80GB HBM3, warm up 3, trials 20
+[Profiling] Using timing method: cuda_event
+[Profiling] Using device: 0 NVIDIA H100 80GB HBM3, warm up 3, trials 20
+{
+  "compiled": true,
+  "correctness": true,
+  "metadata": {
+    "hardware": "NVIDIA H100 80GB HBM3",
+    "device": "0",
+    "correctness_trials": "(5 / 5)"
+  },
+  "runtime": 2.5,
+  "runtime_stats": {
+    "mean": 2.5,
+    "std": 0.247,
+    "min": 2.39,
+    "max": 3.55,
+    "num_trials": 20
+  },
+  "ref_runtime": 11.8,
+  "ref_runtime_stats": {
+    "mean": 11.8,
+    "std": 1.89,
+    "min": 11.4,
+    "max": 20.1,
+    "num_trials": 20
+  },
+  "solution_sha256": "a527df5b90009a36be3cf6b73c6dc413d26c292f029ea0a49a8923a86e8bcf94",
+  "reference_sha256": "333bf992fd77297a4c43f4287b44662dcc43c8036be69d486b28e7a9db7bffd5",
+  "timing_unit": "milliseconds",
+  "correct_trials": 5,
+  "perf_trials": 20,
+  "speedup": 4.720000000000001
+}
+{
+    "compiled": true,
+    "correctness": true,
+    "metadata": {
+        "hardware": "NVIDIA H100 80GB HBM3",
+        "device": "0",
+        "correctness_trials": "(5 / 5)"
+    },
+    "runtime": 2.5,
+    "runtime_stats": {
+        "mean": 2.5,
+        "std": 0.247,
+        "min": 2.39,
+        "max": 3.55,
+        "num_trials": 20
+    },
+    "ref_runtime": 11.8,
+    "ref_runtime_stats": {
+        "mean": 11.8,
+        "std": 1.89,
+        "min": 11.4,
+        "max": 20.1,
+        "num_trials": 20
+    },
+    "solution_sha256": "a527df5b90009a36be3cf6b73c6dc413d26c292f029ea0a49a8923a86e8bcf94",
+    "reference_sha256": "333bf992fd77297a4c43f4287b44662dcc43c8036be69d486b28e7a9db7bffd5",
+    "timing_unit": "milliseconds",
+    "correct_trials": 5,
+    "perf_trials": 20,
+    "speedup": 4.720000000000001
+}
+[?2004hroot@modal:/# cat > /workspace/v6.py << 'EOF'
+[?2004l[?2004h> import torch, triton, torch.nn as nn, torch.nn.functional as F
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> from triton.tools.tensor_descriptor import TensorDescriptor
+[?2004l[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _split_v1(x_ptr, a3_ptr, M, K, sa, BLOCK: tl.constexpr):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     row = tl.program_id(1)
+[?2004l[?2004h>     offs = pid * BLOCK + tl.arange(0, BLOCK)
+[?2004l[?2004h>     mask = offs < K
+[?2004l[?2004h>     x = tl.load(x_ptr + row * K + offs, mask=mask)
+[?2004l[?2004h>     hi = x.to(tl.float16)
+[?2004l[?2004h>     lo = (x - hi.to(tl.float32)).to(tl.float16)
+[?2004l[?2004h>     base = a3_ptr + row * sa
+[?2004l[?2004h>     tl.store(base + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + K + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + 2 * K + offs, lo, mask=mask)
+[?2004l[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _split_v2(x_ptr, a3_ptr, M, K, sa, BLOCK: tl.constexpr):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     nblk = tl.cdiv(K, BLOCK)
+[?2004l[?2004h>     row = pid // nblk
+[?2004l[?2004h>     col = pid % nblk
+[?2004l[?2004h>     offs = col * BLOCK + tl.arange(0, BLOCK)
+[?2004l[?2004h>     mask = offs < K
+[?2004l[?2004h>     x = tl.load(x_ptr + row * K + offs, mask=mask)
+[?2004l[?2004h>     hi = x.to(tl.float16)
+[?2004l[?2004h>     lo = (x - hi.to(tl.float32)).to(tl.float16)
+[?2004l[?2004h>     base = a3_ptr + row * sa
+[?2004l[?2004h>     tl.store(base + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + K + offs, hi, mask=mask)
+[?2004l[?2004h>     tl.store(base + 2 * K + offs, lo, mask=mask)
+[?2004l[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_tma(
+[?2004l[?2004h>     a_desc, b_desc, bias_ptr, c_desc,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h>     off_m = pid_m * BLOCK_M
+[?2004l[?2004h>     off_n = pid_n * BLOCK_N
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         a = a_desc.load([off_m, k * BLOCK_K])
+[?2004l[?2004h>         b = b_desc.load([k * BLOCK_K, off_n])
+[?2004l[?2004h>         acc = tl.dot(a, b, acc)
+[?2004l[?2004h>     rn = off_n + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h>     c_desc.store([off_m, off_n], acc.to(tl.float32))
+[?2004l[?2004h> 
+[?2004l[?2004h> in_features, out_features = 4096, 4096
+[?2004l[?2004h> batch = 16384
+[?2004l[?2004h> x = torch.rand(batch, in_features, device='cuda')
+[?2004l[?2004h> w = torch.randn(out_features, in_features, device='cuda') * 0.02
+[?2004l[?2004h> bias = torch.randn(out_features, device='cuda')
+[?2004l[?2004h> w_hi = w.half(); w_lo = (w - w_hi.float()).half()
+[?2004l[?2004h> B3 = torch.cat([w_hi.t(), w_lo.t(), w_hi.t()], dim=0).contiguous()
+[?2004l[?2004h> M, K = x.shape; N = w.shape[0]; K3 = 3*K
+[?2004l[?2004h> A3 = torch.empty((M, K3), device='cuda', dtype=torch.float16)
+[?2004l[?2004h> out = torch.empty((M, N), device='cuda', dtype=torch.float32)
+[?2004l[?2004h> 
+[?2004l[?2004h> def clear_l2():
+[?2004l[?2004h>     dd = torch.empty((32, 1024, 1024), dtype=torch.int64, device='cuda')
+[?2004l[?2004h>     dd.fill_(42); del dd
+[?2004l[?2004h> 
+[?2004l[?2004h> def time_fn(fn, trials=20):
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         fn(); torch.cuda.synchronize()
+[?2004l[?2004h>     times = []
+[?2004l[?2004h>     for _ in range(trials):
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+[?2004l[?2004h>         clear_l2()
+[?2004l[?2004h>         s.record(); fn(); e.record()
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         times.append(s.elapsed_time(e))
+[?2004l[?2004h>     times = times[1:]
+[?2004l[?2004h>     return sum(times)/len(times), min(times)
+[?2004l[?2004h> 
+[?2004l[?2004h> for blk in [1024, 2048, 4096, 8192]:
+[?2004l[?2004h>     for nw in [4, 8]:
+[?2004l[?2004h>         g = (triton.cdiv(K, blk), M)
+[?2004l[?2004h>         print(f'split_v1 blk={blk} nw={nw}:', time_fn(lambda: _split_v1[g](x, A3, M, K, A3.stride(0), BLOCK=blk, num_warps=nw)))
+[?2004l[?2004h> for blk in [2048, 4096]:
+[?2004l[?2004h>     g = (M * triton.cdiv(K, blk),)
+[?2004l[?2004h>     print(f'split_v2 blk={blk}:', time_fn(lambda: _split_v2[g](x, A3, M, K, A3.stride(0), BLOCK=blk, num_warps=8)))
+[?2004l[?2004h> 
+[?2004l[?2004h> configs = [
+[?2004l[?2004h>     (128,256,64,8,8,4),
+[?2004l[?2004h>     (128,256,64,8,8,5),
+[?2004l[?2004h>     (128,256,64,4,8,4),
+[?2004l[?2004h>     (128,256,64,16,8,4),
+[?2004l[?2004h>     (128,256,32,8,8,4),
+[?2004l[?2004h>     (256,256,32,8,8,3),
+[?2004l[?2004h>     (256,256,64,8,8,2),
+[?2004l[?2004h> ]
+[?2004l[?2004h> for cfg in configs:
+[?2004l[?2004h>     bm, bn, bk, gm, nw, ns = cfg
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         a_desc = TensorDescriptor(A3, A3.shape, A3.stride(), [bm, bk])
+[?2004l[?2004h>         b_desc = TensorDescriptor(B3, B3.shape, B3.stride(), [bk, bn])
+[?2004l[?2004h>         c_desc = TensorDescriptor(out, out.shape, out.stride(), [bm, bn])
+[?2004l[?2004h>         grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>         def run():
+[?2004l[?2004h>             _gemm_tma[grid](a_desc, b_desc, bias, c_desc, M, N, K3, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, num_warps=nw, num_stages=ns)
+[?2004l[?2004h>         print(f'gemm cfg {cfg}:', time_fn(run))
+[?2004l[?2004h>     except Exception as ex:
+[?2004l[?2004h>         print(f'gemm cfg {cfg}: FAIL {type(ex).__name__}')
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# gpu run -- bash -c "python3 /workspace/v6.py > /workspace/v6_out.txt 2>&1; echo done"
+[?2004lrequest ID: 6e47df38da554e4ab0b3c47e882a3824
+box: sb-EMZqwSOGAJFvhrjJWhyGnX
+command: af0916addf444ec382b6a29082478e10
+done
+[?2004hroot@modal:/# gpu sync; cat /workspace/v6_out.txt
+[?2004l{
+  "box": null,
+  "committed": [
+    "agent"
+  ],
+  "reloaded": [
+    "agent"
+  ]
+}
+split_v1 blk=1024 nw=4: (0.2305734722237838, 0.22966399788856506)
+split_v1 blk=1024 nw=8: (0.22953263160429502, 0.2282560020685196)
+split_v1 blk=2048 nw=4: (0.23182315810730583, 0.23110400140285492)
+split_v1 blk=2048 nw=8: (0.23040000074788144, 0.2295999974012375)
+split_v1 blk=4096 nw=4: (0.23252210413154803, 0.23183999955654144)
+split_v1 blk=4096 nw=8: (0.23147452661865636, 0.23071999847888947)
+split_v1 blk=8192 nw=4: (0.22958821058273315, 0.2287999987602234)
+split_v1 blk=8192 nw=8: (0.2300564207528767, 0.22896000742912292)
+split_v2 blk=2048: (0.23089852536979474, 0.22947199642658234)
+split_v2 blk=4096: (0.23119831555768064, 0.23043200373649597)
+gemm cfg (128, 256, 64, 8, 8, 4): (2.169029060162996, 2.1281280517578125)
+gemm cfg (128, 256, 64, 8, 8, 5): FAIL OutOfResources
+gemm cfg (128, 256, 64, 4, 8, 4): (2.191883789865594, 2.1494719982147217)
+gemm cfg (128, 256, 64, 16, 8, 4): (2.180621448316072, 2.144320011138916)
+gemm cfg (128, 256, 32, 8, 8, 4): (2.1882879985006234, 2.1771841049194336)
+gemm cfg (256, 256, 32, 8, 8, 3): FAIL OutOfResources
+gemm cfg (256, 256, 64, 8, 8, 2): FAIL OutOfResources
+[?2004hroot@modal:/# cat > /workspace/v7.py << 'EOF'
+[?2004l[?2004h> import torch, triton, torch.nn as nn, torch.nn.functional as F
+[?2004l[?2004h> import triton.language as tl
+[?2004l[?2004h> from triton.tools.tensor_descriptor import TensorDescriptor
+[?2004l[?2004h> 
+[?2004l[?2004h> @triton.jit
+[?2004l[?2004h> def _gemm_fused(
+[?2004l[?2004h>     x_desc, bhi_desc, blo_desc, bias_ptr, c_desc,
+[?2004l[?2004h>     M, N, K,
+[?2004l[?2004h>     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+[?2004l[?2004h>     GROUP_M: tl.constexpr,
+[?2004l[?2004h> ):
+[?2004l[?2004h>     pid = tl.program_id(0)
+[?2004l[?2004h>     grid_m = tl.cdiv(M, BLOCK_M)
+[?2004l[?2004h>     grid_n = tl.cdiv(N, BLOCK_N)
+[?2004l[?2004h>     width = GROUP_M * grid_n
+[?2004l[?2004h>     group_id = pid // width
+[?2004l[?2004h>     group_size = tl.minimum(grid_m - group_id * GROUP_M, GROUP_M)
+[?2004l[?2004h>     pid_m = group_id * GROUP_M + (pid % group_size)
+[?2004l[?2004h>     pid_n = (pid % width) // group_size
+[?2004l[?2004h>     off_m = pid_m * BLOCK_M
+[?2004l[?2004h>     off_n = pid_n * BLOCK_N
+[?2004l[?2004h>     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+[?2004l[?2004h>     for k in range(0, tl.cdiv(K, BLOCK_K)):
+[?2004l[?2004h>         a = x_desc.load([off_m, k * BLOCK_K])
+[?2004l[?2004h>         bhi = bhi_desc.load([k * BLOCK_K, off_n])
+[?2004l[?2004h>         blo = blo_desc.load([k * BLOCK_K, off_n])
+[?2004l[?2004h>         a_hi = a.to(tl.float16)
+[?2004l[?2004h>         a_lo = (a - a_hi.to(tl.float32)).to(tl.float16)
+[?2004l[?2004h>         acc = tl.dot(a_hi, bhi, acc)
+[?2004l[?2004h>         acc = tl.dot(a_hi, blo, acc)
+[?2004l[?2004h>         acc = tl.dot(a_lo, bhi, acc)
+[?2004l[?2004h>     rn = off_n + tl.arange(0, BLOCK_N)
+[?2004l[?2004h>     bias = tl.load(bias_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)
+[?2004l[?2004h>     acc = acc + bias[None, :]
+[?2004l[?2004h>     c_desc.store([off_m, off_n], acc.to(tl.float32))
+[?2004l[?2004h> 
+[?2004l[?2004h> in_features, out_features = 4096, 4096
+[?2004l[?2004h> batch = 16384
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> lin = nn.Linear(in_features, out_features).cuda()
+[?2004l[?2004h> w = lin.weight * 1.5
+[?2004l[?2004h> b = lin.bias.contiguous()
+[?2004l[?2004h> x = torch.rand(batch, in_features, device='cuda')
+[?2004l[?2004h> ref = F.linear(x, w, b)
+[?2004l[?2004h> w_hi = w.half(); w_lo = (w - w_hi.float()).half()
+[?2004l[?2004h> Bhi = w_hi.t().contiguous(); Blo = w_lo.t().contiguous()
+[?2004l[?2004h> M, K = x.shape; N = w.shape[0]
+[?2004l[?2004h> out = torch.empty((M, N), device='cuda', dtype=torch.float32)
+[?2004l[?2004h> 
+[?2004l[?2004h> def clear_l2():
+[?2004l[?2004h>     dd = torch.empty((32, 1024, 1024), dtype=torch.int64, device='cuda')
+[?2004l[?2004h>     dd.fill_(42); del dd
+[?2004l[?2004h> 
+[?2004l[?2004h> def time_fn(fn, trials=20):
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         fn(); torch.cuda.synchronize()
+[?2004l[?2004h>     times = []
+[?2004l[?2004h>     for _ in range(trials):
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         s = torch.cuda.Event(enable_timing=True); e = torch.cuda.Event(enable_timing=True)
+[?2004l[?2004h>         clear_l2()
+[?2004l[?2004h>         s.record(); fn(); e.record()
+[?2004l[?2004h>         torch.cuda.synchronize()
+[?2004l[?2004h>         times.append(s.elapsed_time(e))
+[?2004l[?2004h>     times = times[1:]
+[?2004l[?2004h>     return sum(times)/len(times), min(times)
+[?2004l[?2004h> 
+[?2004l[?2004h> configs = [
+[?2004l[?2004h>     (128,256,64,8,8,3),
+[?2004l[?2004h>     (128,128,64,8,8,3),
+[?2004l[?2004h>     (128,256,32,8,8,4),
+[?2004l[?2004h>     (128,128,32,8,8,4),
+[?2004l[?2004h>     (128,128,64,8,8,4),
+[?2004l[?2004h>     (256,128,64,8,8,3),
+[?2004l[?2004h> ]
+[?2004l[?2004h> best=None
+[?2004l[?2004h> for cfg in configs:
+[?2004l[?2004h>     bm, bn, bk, gm, nw, ns = cfg
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         x_desc = TensorDescriptor(x, x.shape, x.stride(), [bm, bk])
+[?2004l[?2004h>         bhi_desc = TensorDescriptor(Bhi, Bhi.shape, Bhi.stride(), [bk, bn])
+[?2004l[?2004h>         blo_desc = TensorDescriptor(Blo, Blo.shape, Blo.stride(), [bk, bn])
+[?2004l[?2004h>         c_desc = TensorDescriptor(out, out.shape, out.stride(), [bm, bn])
+[?2004l[?2004h>         grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+[?2004l[?2004h>         def run():
+[?2004l[?2004h>             _gemm_fused[grid](x_desc, bhi_desc, blo_desc, b, c_desc, M, N, K,
+[?2004l[?2004h>                 BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=gm, num_warps=nw, num_stages=ns)
+[?2004l[?2004h>         run(); torch.cuda.synchronize()
+[?2004l[?2004h>         d = (ref - out).abs(); tol = 1e-4 + 1e-4*ref.abs()
+[?2004l[?2004h>         rel = (d/tol).max().item()
+[?2004l[?2004h>         t = time_fn(run)
+[?2004l[?2004h>         print(f'v7 cfg {cfg}: mean {t[0]:.3f} min {t[1]:.3f} rel {rel:.3f}')
+[?2004l[?2004h>         if best is None or t[0] < best[0]: best=(t[0],cfg)
+[?2004l[?2004h>     except Exception as ex:
+[?2004l[?2004h>         print(f'v7 cfg {cfg}: FAIL {type(ex).__name__}: {ex}')
+[?2004l[?2004h> print('BEST v7:', best)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@modal:/# gpu run -- bash -c "python3 /workspace/v7.py > /workspace/v7_out.txt 2>&1; echo done"
+[?2004lrequest ID: 08586f8e081c4a1ba1c10c26d3d1b20b
+box: sb-p2aOaIarSoiwZ5N1KQtWB7
+command: c001711c925447ddb2e3c27ae9ae3fb9
+done
+[?2004hroot@modal:/# gpu sync; cat /workspace/v7_out.txt
+[?2004l{
+  "box": null,
+  "committed": [
+    "agent"
+  ],
+  "reloaded": [
+    "agent"
+  ]
+}
+v7 cfg (128, 256, 64, 8, 8, 3): FAIL OutOfResources: out of resource: shared memory, Required: 262192, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
+v7 cfg (128, 128, 64, 8, 8, 3): mean 3.073 min 3.048 rel 0.221
+v7 cfg (128, 256, 32, 8, 8, 4): mean 2.701 min 2.610 rel 0.220
+v7 cfg (128, 128, 32, 8, 8, 4): mean 2.486 min 2.403 rel 0.220
+v7 cfg (128, 128, 64, 8, 8, 4): mean 3.168 min 3.098 rel 0.221
+v7 cfg (256, 128, 64, 8, 8, 3): mean 2.972 min 2.881 rel 0.221
+BEST v7: (2.4864757813905416, (128, 128, 32, 8, 8, 4))
+[?2004hroot@modal:/# 
